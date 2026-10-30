@@ -250,7 +250,29 @@ class Config:
 def _require(mapping: Dict[str, Any], key: str, typ: type, where: str) -> Any:
     if key not in mapping:
         raise ConfigError(f"[{where}] 缺少必填字段: {key}")
-    value = mapping[key]
+    return _coerce(mapping[key], typ, key, where)
+
+
+def _coerce(value: Any, typ: type, key: str, where: str) -> Any:
+    """字段类型校验与宽容策略。
+
+    TOML 区分整数字面量与浮点字面量，但数值语义上 150 与 150.0 等价，
+    因此 float 字段接受 int 并显式转 float（否则用户写
+    max_train_seconds = 150 会被误判"类型应为 float，实际为 int"，
+    而 config.example.toml 自己就曾这样写）。int 字段保持严格：
+    epochs = 120.5 之类应当报错而不是静默截断。
+
+    bool 必须显式排除：isinstance(True, int) 为 True，不拦住的话
+    min_samples = true 会静默变成 1。
+    """
+    if typ is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"[{where}] 字段 {key} 类型应为 float，实际为 {type(value).__name__}")
+        return float(value)
+    if typ is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"[{where}] 字段 {key} 类型应为 int，实际为 {type(value).__name__}")
+        return value
     if not isinstance(value, typ):
         raise ConfigError(f"[{where}] 字段 {key} 类型应为 {typ.__name__}，实际为 {type(value).__name__}")
     return value
@@ -259,12 +281,7 @@ def _require(mapping: Dict[str, Any], key: str, typ: type, where: str) -> Any:
 def _optional(mapping: Dict[str, Any], key: str, default: Any, typ: type, where: str) -> Any:
     if key not in mapping or mapping[key] is None:
         return default
-    value = mapping[key]
-    if isinstance(value, bool) and typ is float:
-        value = float(value)
-    if not isinstance(value, typ):
-        raise ConfigError(f"[{where}] 字段 {key} 类型应为 {typ.__name__}，实际为 {type(value).__name__}")
-    return value
+    return _coerce(mapping[key], typ, key, where)
 
 
 def _num_list(mapping: Dict[str, Any], key: str, where: str) -> Optional[List[float]]:

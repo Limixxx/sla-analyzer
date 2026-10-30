@@ -164,7 +164,8 @@ min_r2 = 0.5
 max_samples = 4000
 # 训练时长硬预算（秒）：超时即用已训轮次，保证压测总时长可控。
 # 参考基准（本机）：4000 样本 + [12,12] 全量交叉验证 + 终训 ≈ 95s
-max_train_seconds = 150
+# （float 字段，写 150 或 150.0 均可）
+max_train_seconds = 150.0
 # 模型文件：.npz（ZIP + .npy 容器），可被 numpy 生态 np.load() 直接消费。
 # --report-only 时若文件存在则直接加载重算，不存在则按当前配置重训
 save_path = "results/qos_model.npz"
