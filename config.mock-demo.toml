@@ -1,7 +1,10 @@
 # 自测配置：配合 mock_server.py 在本地验证 benchmark 工具全链路。
 # 用法：
-#   python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --soft-capacity 8 --hard-capacity 12
+#   python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --ttft-per-1k-tokens 60 \
+#       --soft-capacity 8 --hard-capacity 12
 #   python bench.py --config config.mock-demo.toml
+# 验证 baseline_relative 口径：把 [slo] 的 target_mode 改为 baseline_relative，
+# 并适当增大 baseline_duration_s（保证每桶样本 >= analysis.min_samples_per_stage）。
 
 [service]
 base_url = "http://127.0.0.1:8123"
@@ -16,11 +19,17 @@ verify_tls = false
 ttft_target_s = 1.0
 tpot_target_ms = 40.0
 min_completion_tokens = 2
+# absolute = 固定门限；baseline_relative = Phase 0 基线 p99 × 系数（按长度桶生效）
+target_mode = "absolute"
+ttft_factor = 3.0
+tpot_factor = 2.0
 
 [load]
 mode = "closed"
 concurrency_steps = [1, 2, 4, 8, 16, 24, 32]
 stage_duration_s = 12.0
+# 自测用：低压级别样本不足时最长延至 30s（mock 的 E2E≈1s，样本来得快）
+max_stage_duration_s = 30.0
 warmup_s = 3.0
 think_time_s = 0.0
 max_requests_per_stage = 800
@@ -37,11 +46,13 @@ stream = true
 unique_prefix = true
 seed = 20241030
 chars_per_token = 3.5
+# ≤256 / 257-1024 / >1024 三桶；配合 mock 的 --ttft-per-1k-tokens 可验证按桶门限
+length_buckets = [256, 1024]
 
 [analysis]
 sla_target = 0.999
 slo_target = 0.9
-min_samples_per_stage = 30
+min_samples_per_stage = 15
 
 [storage]
 db_path = "results/selfcheck.db"

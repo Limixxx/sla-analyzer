@@ -14,6 +14,12 @@
 
     # 3) 仅由已有数据库重新生成报告
     python bench.py --report-only --db results/bench_xxx.db --config config.toml
+
+    # 4) 更换引擎/模型后快速重测基线（仅 Phase 0，不压测）
+    python bench.py --config config.toml --baseline-only
+
+    # 5) 跳过 Phase 0，直接用 absolute 门限压测
+    python bench.py --config config.toml --no-baseline
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import time
 from pathlib import Path
 
 from bench import __version__
+from bench.baseline import resolve_thresholds
 from bench.config import Config, ConfigError, load_config
 from bench.metrics import StageStats, find_capacity
 from bench.prompts import PromptFactory
@@ -51,6 +58,17 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--report", help="覆盖报告输出路径")
     parser.add_argument("--probe", action="store_true", help="仅做连通性/单请求探针，不压测")
     parser.add_argument("--report-only", action="store_true", help="由已有数据库重新生成报告")
+    parser.add_argument(
+        "--target-mode",
+        choices=["absolute", "baseline_relative"],
+        help="覆盖 slo.target_mode（门限来源）",
+    )
+    parser.add_argument("--no-baseline", action="store_true", help="跳过 Phase 0 基线剖析")
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="仅执行 Phase 0 基线剖析并打印各桶分位数与生效门限，不做正式压测",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -79,6 +97,16 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> None:
             cfg.load.concurrency_steps = sorted({int(x) for x in args.steps.split(",") if x.strip()})
         except ValueError:
             raise ConfigError(f"--steps 解析失败: {args.steps}")
+    if args.target_mode:
+        cfg.slo.target_mode = args.target_mode
+    if args.no_baseline:
+        if args.baseline_only:
+            raise ConfigError("--no-baseline 与 --baseline-only 互斥")
+        cfg.load.baseline_enabled = False
+        if cfg.slo.target_mode == "baseline_relative":
+            cfg.slo.target_mode = "absolute"
+            print("[note] --no-baseline 已跳过 Phase 0 基线，target_mode 由 "
+                  "baseline_relative 回退为 absolute 门限。")
 
 
 def _default_paths(cfg: Config) -> None:
@@ -137,10 +165,20 @@ async def _probe_impl(cfg: Config) -> int:
     return 2
 
 
-def _stats_from_store(store: RecordStore, cfg: Config) -> list:
+def _stats_from_store(store: RecordStore, cfg: Config):
+    """从数据库重建分级统计（--report-only 路径）。
+
+    门限按 target_mode 重新解析：absolute 用配置值；baseline_relative 从
+    baseline 表重建基线后按桶计算。旧版本数据库没有 baseline 表时自动回退。
+    返回 (stats, thresholds, baseline)。
+    """
+    baseline = store.load_baseline() if cfg.slo.target_mode == "baseline_relative" else None
+    thresholds = resolve_thresholds(cfg, baseline)
+
     stats: list = []
     for row in store.all_stages():
-        stats.append(StageStats(
+        keys = row.keys()
+        entry = StageStats(
             stage_id=row["id"],
             concurrency=row["concurrency"],
             duration_s=row["duration_s"] or 0.0,
@@ -149,6 +187,7 @@ def _stats_from_store(store: RecordStore, cfg: Config) -> list:
             n_warmup=row["n_warmup"] or 0,
             n_ok=row["n_ok"] or 0,
             n_failed=row["n_failed"] or 0,
+            n_aborted=(row["n_aborted"] or 0) if "n_aborted" in keys else 0,
             a1=row["a1"] or 0,
             a2=row["a2"] or 0,
             a3=row["a3"] or 0,
@@ -164,8 +203,21 @@ def _stats_from_store(store: RecordStore, cfg: Config) -> list:
             tpot_target_ms=cfg.slo.tpot_target_ms,
             sla_target=cfg.analysis.sla_target,
             slo_target=cfg.analysis.slo_target,
-        ))
-    return stats
+        )
+        # 分桶明细：DB 里有则按桶重建，否则退化为单桶（兼容旧库）
+        bucket_rows = store.stage_buckets(entry.stage_id)
+        if bucket_rows:
+            for b in bucket_rows:
+                entry.bucket_stats[b["bucket"]] = {
+                    "n": b["n"] or 0, "a1": b["a1"] or 0, "a2": b["a2"] or 0, "a3": b["a3"] or 0,
+                    "a3_ttft_only": b["a3_ttft_only"] or 0,
+                    "a3_tpot_only": b["a3_tpot_only"] or 0,
+                    "a3_both": b["a3_both"] or 0,
+                    "ttft_p99_ms": b["ttft_p99_ms"], "tpot_p99_ms": b["tpot_p99_ms"],
+                    "ttft_limit_ms": b["ttft_limit_ms"], "tpot_limit_ms": b["tpot_limit_ms"],
+                }
+        stats.append(entry)
+    return stats, thresholds, baseline
 
 
 async def _amain(args: argparse.Namespace) -> int:
@@ -176,17 +228,47 @@ async def _amain(args: argparse.Namespace) -> int:
     if args.probe:
         return await _probe_impl(cfg)
 
+    if args.baseline_only:
+        if cfg.slo.target_mode != "baseline_relative":
+            raise ConfigError(
+                "--baseline-only 仅用于 baseline_relative 模式（absolute 模式门限与基线无关，"
+                "直接用 --probe 或完整压测即可）"
+            )
+        store = RecordStore(cfg.storage.db_path)
+        try:
+            store.set_meta("started_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+            store.set_meta("config", json.dumps(cfg.summary(), ensure_ascii=False))
+            store.set_meta("db_path", cfg.storage.db_path)
+            store.set_meta("tool_version", __version__)
+            runner = BenchmarkRunner(cfg, store)
+            baseline = await runner.run_baseline_only()
+            print("=" * 72)
+            print(f"[done] 基线已写入数据库: {cfg.storage.db_path}")
+            if any(b in baseline.thin_buckets for b in range(len(baseline.buckets))):
+                print(
+                    "[done] 提示：部分桶样本不足，门限将回退 absolute；"
+                    "可增大 load.baseline_duration_s 后重测。"
+                )
+            print("[done] 未生成正式报告（--baseline-only 不做压测）；确认门限后可运行完整压测。")
+            print("=" * 72)
+            return 0
+        finally:
+            store.close()
+
     if args.report_only:
         if not Path(cfg.storage.db_path).exists():
             print(f"[error] 数据库不存在: {cfg.storage.db_path}", file=sys.stderr)
             return 2
         store = RecordStore(cfg.storage.db_path)
         try:
-            stats = _stats_from_store(store, cfg)
+            stats, thresholds, baseline = _stats_from_store(store, cfg)
             finding = find_capacity(stats, cfg.analysis)
             meta = store.meta_items()
             meta.setdefault("db_path", cfg.storage.db_path)
-            path = write_report(cfg, store, stats, finding, meta, cfg.report.output_path)
+            path = write_report(
+                cfg, store, stats, finding, meta, cfg.report.output_path,
+                thresholds=thresholds, baseline=baseline,
+            )
             print(f"[done] 报告已生成: {path}")
             return 0
         finally:
@@ -202,7 +284,12 @@ async def _amain(args: argparse.Namespace) -> int:
         print("=" * 72)
         print("PD 分离推理 QoS 压测")
         print(f"  目标      : {cfg.service.base_url}{cfg.service.path}  model={cfg.service.model}")
-        print(f"  门限      : TTFT<={cfg.slo.ttft_target_s}s  TPOT<={cfg.slo.tpot_target_ms}ms")
+        if cfg.slo.target_mode == "absolute":
+            print(f"  门限      : TTFT<={cfg.slo.ttft_target_s}s  TPOT<={cfg.slo.tpot_target_ms}ms"
+                  f"（absolute，全部长度桶统一）")
+        else:
+            print(f"  门限      : baseline_relative（基线 p99 × TTFT {cfg.slo.ttft_factor} / "
+                  f"TPOT {cfg.slo.tpot_factor}，按长度桶 {cfg.requests.length_buckets} 生效）")
         print(f"  目标      : SLA>={cfg.analysis.sla_target:.1%}  SLO>={cfg.analysis.slo_target:.1%}")
         print(f"  压力级    : {cfg.load.concurrency_steps}  每级 {cfg.load.stage_duration_s}s"
               f"（预热 {cfg.load.warmup_s}s）")
@@ -211,19 +298,50 @@ async def _amain(args: argparse.Namespace) -> int:
 
         runner = BenchmarkRunner(cfg, store)
         stats = await runner.run()
+        thresholds = runner.thresholds
+        baseline = runner.baseline
         finding = find_capacity(stats, cfg.analysis)
 
         meta = store.meta_items()
-        path = write_report(cfg, store, stats, finding, meta, cfg.report.output_path)
+        path = write_report(
+            cfg, store, stats, finding, meta, cfg.report.output_path,
+            thresholds=thresholds, baseline=baseline,
+        )
         print("=" * 72)
         print(f"[done] 数据库: {cfg.storage.db_path}")
         print(f"[done] 报告  : {path}")
-        if finding.reached:
-            print(f"[done] 结论  : 3 个 9（SLA>={cfg.analysis.sla_target:.1%}）对应最高并发 "
-                  f"{finding.sla_capacity}，该点 SLO={finding.slo_at_sla_capacity:.4f}")
+        if finding.quality_capacity is not None:
+            print(
+                f"[done] 结论  : 质量有效容量（SLA>={cfg.analysis.sla_target:.1%} 且 "
+                f"SLO>={cfg.analysis.slo_target:.1%}）= 并发 {finding.quality_capacity}；"
+                f"3 个 9 口径（仅 SLA）容量 = {finding.sla_capacity}"
+                + (
+                    f"（该点 SLO={finding.slo_at_sla_capacity:.4f}，无质量意义）"
+                    if finding.slo_at_sla_capacity is not None
+                    and finding.slo_at_sla_capacity < cfg.analysis.slo_target
+                    else ""
+                )
+            )
+        elif all(s.n_total == 0 for s in stats):
+            print(
+                f"[done] 结论  : 所有压力级均无完成请求（共放弃 "
+                f"{sum(s.n_aborted for s in stats)} 个在途请求），"
+                "请增大 load.drain_timeout_s / load.stage_duration_s 后复测"
+            )
         else:
-            print(f"[done] 结论  : 未达到 SLA {cfg.analysis.sla_target:.1%} 目标，"
-                  f"最高 SLA={finding.best_sla:.4f}（并发 {finding.best_sla_concurrency}）")
+            ref = finding.reference_capacity
+            sla_txt = str(finding.sla_capacity) if finding.sla_capacity is not None else "未达到"
+            print(
+                f"[done] 结论  : 未找到同时满足 SLA/SLO 目标的压力级"
+                + (f"；低置信度参考容量 = 并发 {ref}（SLO={finding.slo_at_reference_capacity:.4f}）" if ref is not None else "")
+                + f"；3 个 9 口径（仅 SLA）容量 = {sla_txt}"
+                + (
+                    f"（该点 SLO={finding.slo_at_sla_capacity:.4f}，无质量意义）"
+                    if finding.slo_at_sla_capacity is not None
+                    and finding.slo_at_sla_capacity < cfg.analysis.slo_target
+                    else ""
+                )
+            )
         print("=" * 72)
         return 0
     finally:

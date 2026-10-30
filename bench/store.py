@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS stages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     concurrency     INTEGER NOT NULL,
     mode            TEXT NOT NULL DEFAULT 'closed',
+    kind            TEXT NOT NULL DEFAULT 'stage',
     started_at      REAL,
     ended_at        REAL,
     duration_s      REAL,
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS stages (
     n_total         INTEGER DEFAULT 0,
     n_ok            INTEGER DEFAULT 0,
     n_failed        INTEGER DEFAULT 0,
+    n_aborted       INTEGER DEFAULT 0,
     a1              INTEGER DEFAULT 0,
     a2              INTEGER DEFAULT 0,
     a3              INTEGER DEFAULT 0,
@@ -43,6 +45,38 @@ CREATE TABLE IF NOT EXISTS stages (
     completion_tokens_avg REAL,
     fail_kinds_json TEXT
 );
+CREATE TABLE IF NOT EXISTS stage_buckets (
+    stage_id      INTEGER NOT NULL,
+    bucket        INTEGER NOT NULL,
+    n             INTEGER DEFAULT 0,
+    a1            INTEGER DEFAULT 0,
+    a2            INTEGER DEFAULT 0,
+    a3            INTEGER DEFAULT 0,
+    a3_ttft_only  INTEGER DEFAULT 0,
+    a3_tpot_only  INTEGER DEFAULT 0,
+    a3_both       INTEGER DEFAULT 0,
+    ttft_p99_ms   REAL,
+    tpot_p99_ms   REAL,
+    ttft_limit_ms REAL,
+    tpot_limit_ms REAL
+);
+CREATE INDEX IF NOT EXISTS idx_stage_buckets ON stage_buckets(stage_id);
+CREATE TABLE IF NOT EXISTS baseline (
+    stage_id      INTEGER NOT NULL,
+    concurrency   INTEGER,
+    duration_s    REAL,
+    bucket        INTEGER NOT NULL,
+    n             INTEGER DEFAULT 0,
+    n_ok          INTEGER DEFAULT 0,
+    a1            INTEGER DEFAULT 0,
+    ttft_p50_ms   REAL,
+    ttft_p95_ms   REAL,
+    ttft_p99_ms   REAL,
+    tpot_p50_ms   REAL,
+    tpot_p95_ms   REAL,
+    tpot_p99_ms   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_baseline_stage ON baseline(stage_id);
 CREATE TABLE IF NOT EXISTS requests (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     stage_id             INTEGER NOT NULL,
@@ -87,13 +121,33 @@ INSERT INTO requests (
 
 _INSERT_STAGE = """
 INSERT INTO stages (
-    concurrency, mode, started_at, ended_at, duration_s, warmup_s, n_warmup
-) VALUES (:concurrency, :mode, :started_at, :ended_at, :duration_s, :warmup_s, :n_warmup)
+    concurrency, mode, kind, started_at, ended_at, duration_s, warmup_s, n_warmup
+) VALUES (:concurrency, :mode, :kind, :started_at, :ended_at, :duration_s, :warmup_s, :n_warmup)
+"""
+
+_INSERT_BUCKET = """
+INSERT INTO stage_buckets (
+    stage_id, bucket, n, a1, a2, a3, a3_ttft_only, a3_tpot_only, a3_both,
+    ttft_p99_ms, tpot_p99_ms, ttft_limit_ms, tpot_limit_ms
+) VALUES (
+    :stage_id, :bucket, :n, :a1, :a2, :a3, :a3_ttft_only, :a3_tpot_only, :a3_both,
+    :ttft_p99_ms, :tpot_p99_ms, :ttft_limit_ms, :tpot_limit_ms
+)
+"""
+
+_INSERT_BASELINE = """
+INSERT INTO baseline (
+    stage_id, concurrency, duration_s, bucket, n, n_ok, a1,
+    ttft_p50_ms, ttft_p95_ms, ttft_p99_ms, tpot_p50_ms, tpot_p95_ms, tpot_p99_ms
+) VALUES (
+    :stage_id, :concurrency, :duration_s, :bucket, :n, :n_ok, :a1,
+    :ttft_p50_ms, :ttft_p95_ms, :ttft_p99_ms, :tpot_p50_ms, :tpot_p95_ms, :tpot_p99_ms
+)
 """
 
 _UPDATE_STAGE = """
 UPDATE stages SET
-    n_total=:n_total, n_ok=:n_ok, n_failed=:n_failed,
+    n_total=:n_total, n_ok=:n_ok, n_failed=:n_failed, n_aborted=:n_aborted,
     a1=:a1, a2=:a2, a3=:a3, slo=:slo, sla=:sla,
     ttft_p50_ms=:ttft_p50_ms, ttft_p90_ms=:ttft_p90_ms, ttft_p99_ms=:ttft_p99_ms,
     tpot_p50_ms=:tpot_p50_ms, tpot_p90_ms=:tpot_p90_ms, tpot_p99_ms=:tpot_p99_ms,
@@ -117,8 +171,21 @@ class RecordStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
         self._pending: List[Dict[str, Any]] = []
+
+    def _migrate(self) -> None:
+        """轻量迁移：为旧版本数据库补齐新列，保证 --report-only 兼容。"""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(stages)")}
+        if "kind" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN kind TEXT NOT NULL DEFAULT 'stage'"
+            )
+        if "n_aborted" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN n_aborted INTEGER DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------ #
     def set_meta(self, key: str, value: str) -> None:
@@ -133,12 +200,20 @@ class RecordStore:
         row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
-    def start_stage(self, concurrency: int, mode: str, duration_s: float, warmup_s: float) -> int:
+    def start_stage(
+        self,
+        concurrency: int,
+        mode: str,
+        duration_s: float,
+        warmup_s: float,
+        kind: str = "stage",
+    ) -> int:
         cur = self._conn.execute(
             _INSERT_STAGE,
             {
                 "concurrency": concurrency,
                 "mode": mode,
+                "kind": kind,
                 "started_at": time.time(),
                 "ended_at": None,
                 "duration_s": duration_s,
@@ -169,8 +244,94 @@ class RecordStore:
         row["ended_at"] = time.time()
         row["fail_kinds_json"] = _json.dumps(stats.fail_kinds, ensure_ascii=False)
         self._conn.execute(_UPDATE_STAGE, row)
+        # 按长度桶的拆分另存一张表，避免把字典塞进 stages
+        if getattr(stats, "bucket_stats", None):
+            self._conn.execute("DELETE FROM stage_buckets WHERE stage_id=?", (stage_id,))
+            self._conn.executemany(_INSERT_BUCKET, [
+                {
+                    "stage_id": stage_id,
+                    "bucket": idx,
+                    "n": entry.get("n", 0),
+                    "a1": entry.get("a1", 0),
+                    "a2": entry.get("a2", 0),
+                    "a3": entry.get("a3", 0),
+                    "a3_ttft_only": entry.get("a3_ttft_only", 0),
+                    "a3_tpot_only": entry.get("a3_tpot_only", 0),
+                    "a3_both": entry.get("a3_both", 0),
+                    "ttft_p99_ms": entry.get("ttft_p99_ms"),
+                    "tpot_p99_ms": entry.get("tpot_p99_ms"),
+                    "ttft_limit_ms": entry.get("ttft_limit_ms"),
+                    "tpot_limit_ms": entry.get("tpot_limit_ms"),
+                }
+                for idx, entry in sorted(stats.bucket_stats.items())
+            ])
         self._conn.commit()
         self.flush_requests()
+
+    def save_baseline(
+        self,
+        stage_id: int,
+        concurrency: int,
+        duration_s: float,
+        result: Any,
+    ) -> None:
+        """落库 Phase 0 基线结果（供 --report-only 重建门限）。"""
+        self._conn.execute("DELETE FROM baseline WHERE stage_id=?", (stage_id,))
+        rows = [
+            {
+                "stage_id": stage_id,
+                "concurrency": concurrency,
+                "duration_s": duration_s,
+                "bucket": entry.bucket,
+                "n": entry.n,
+                "n_ok": entry.n_ok,
+                "a1": entry.a1,
+                "ttft_p50_ms": entry.ttft_p50_ms,
+                "ttft_p95_ms": entry.ttft_p95_ms,
+                "ttft_p99_ms": entry.ttft_p99_ms,
+                "tpot_p50_ms": entry.tpot_p50_ms,
+                "tpot_p95_ms": entry.tpot_p95_ms,
+                "tpot_p99_ms": entry.tpot_p99_ms,
+            }
+            for entry in result.buckets
+        ]
+        self._conn.executemany(_INSERT_BASELINE, rows)
+        self._conn.commit()
+
+    def load_baseline(self) -> Optional[Any]:
+        """从数据库重建基线结果；无基线表/无数据时返回 None。"""
+        from .baseline import BaselineResult, BucketBaseline
+
+        exists = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='baseline'"
+        ).fetchone()
+        if not exists:
+            return None
+        rows = self._conn.execute("SELECT * FROM baseline ORDER BY bucket").fetchall()
+        if not rows:
+            return None
+        result = BaselineResult(
+            concurrency=rows[0]["concurrency"] or 0,
+            duration_s=rows[0]["duration_s"] or 0.0,
+            buckets=[
+                BucketBaseline(
+                    bucket=r["bucket"],
+                    n=r["n"] or 0,
+                    n_ok=r["n_ok"] or 0,
+                    a1=r["a1"] or 0,
+                    ttft_p50_ms=r["ttft_p50_ms"],
+                    ttft_p95_ms=r["ttft_p95_ms"],
+                    ttft_p99_ms=r["ttft_p99_ms"],
+                    tpot_p50_ms=r["tpot_p50_ms"],
+                    tpot_p95_ms=r["tpot_p95_ms"],
+                    tpot_p99_ms=r["tpot_p99_ms"],
+                )
+                for r in rows
+            ],
+        )
+        result.total_n = sum(b.n for b in result.buckets)
+        result.total_a1 = sum(b.a1 for b in result.buckets)
+        return result
 
     # ------------------------------------------------------------------ #
     def stage_rows(self, stage_id: int, include_warmup: bool = False) -> List[Dict[str, Any]]:
@@ -186,8 +347,29 @@ class RecordStore:
         ).fetchone()
         return int(row["c"])
 
-    def all_stages(self) -> List[Dict[str, Any]]:
-        return [dict(r) for r in self._conn.execute("SELECT * FROM stages ORDER BY id").fetchall()]
+    def aborted_count(self, stage_id: int) -> int:
+        """本级被放弃的在途请求数（含预热段；预热段放弃同样说明 drain 窗口不足）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM requests WHERE stage_id=? AND status='aborted'", (stage_id,)
+        ).fetchone()
+        return int(row["c"])
+
+    def all_stages(self, kind: str = "stage") -> List[Dict[str, Any]]:
+        """取指定类型的阶段；默认只取正式压力级，排除 Phase 0 基线阶段。"""
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM stages WHERE kind=? ORDER BY id", (kind,)
+            ).fetchall()
+        ]
+
+    def stage_buckets(self, stage_id: int) -> List[Dict[str, Any]]:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM stage_buckets WHERE stage_id=? ORDER BY bucket", (stage_id,)
+            ).fetchall()
+        ]
 
     def meta_items(self) -> Dict[str, str]:
         return {r["key"]: r["value"] for r in self._conn.execute("SELECT key, value FROM meta").fetchall()}

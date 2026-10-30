@@ -30,6 +30,9 @@ _WORDS = (
 class MockState:
     def __init__(self, args: argparse.Namespace):
         self.ttft_ms = args.ttft_ms
+        # 每 1024 个 prompt token 增加的 TTFT（ms），模拟 prefill 随上下文增长的耗时。
+        # 置 0 表示 TTFT 与长度无关（旧行为）。
+        self.ttft_per_1k_ms = args.ttft_per_1k_ms
         self.tpot_ms = args.tpot_ms
         self.soft_capacity = max(1, args.soft_capacity)
         self.hard_capacity = max(self.soft_capacity, args.hard_capacity)
@@ -40,6 +43,11 @@ class MockState:
     def load_factor(self) -> float:
         """在途/软容量的负载系数，>1 表示进入缓冲区。"""
         return self.in_flight / float(self.soft_capacity)
+
+    def base_ttft_s(self, prompt_tokens: int) -> float:
+        """无排队时的 TTFT（秒）：固定分量 + 与 prompt 长度相关的分量。"""
+        extra = (prompt_tokens / 1024.0) * (self.ttft_per_1k_ms / 1000.0)
+        return self.ttft_ms / 1000.0 + extra
 
 
 async def _read_request(reader: asyncio.StreamReader) -> Dict:
@@ -126,7 +134,7 @@ async def _handle_chat(state: MockState, payload: Dict, writer: asyncio.StreamWr
                                                      "type": "internal"}})
             return
 
-        effective_ttft_s = state.ttft_ms / 1000.0 + queue_wait_s
+        effective_ttft_s = state.base_ttft_s(prompt_tokens) + queue_wait_s
         effective_tpot_s = (state.tpot_ms / 1000.0) * tpot_scale
 
         if not stream:
@@ -224,7 +232,7 @@ async def _serve(args: argparse.Namespace) -> None:
     state = MockState(args)
     server = await asyncio.start_server(lambda r, w: _handle(state, r, w), args.host, args.port)
     print(f"[mock] listening on http://{args.host}:{args.port}  "
-          f"ttft={args.ttft_ms}ms tpot={args.tpot_ms}ms "
+          f"ttft={args.ttft_ms}ms ttft_per_1k={args.ttft_per_1k_ms}ms tpot={args.tpot_ms}ms "
           f"soft_capacity={state.soft_capacity} hard_capacity={state.hard_capacity} "
           f"error_rate={args.error_rate}")
     async with server:
@@ -236,6 +244,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8123)
     parser.add_argument("--ttft-ms", type=float, default=200.0)
+    parser.add_argument("--ttft-per-1k-tokens", type=float, default=0.0, dest="ttft_per_1k_ms",
+                        help="每 1024 个 prompt token 额外增加的 TTFT（ms），0 表示与长度无关")
     parser.add_argument("--tpot-ms", type=float, default=15.0)
     parser.add_argument("--soft-capacity", type=int, default=8, help="超过后开始排队/降速")
     parser.add_argument("--hard-capacity", type=int, default=12, help="超过后直接 503 拒绝")

@@ -22,6 +22,16 @@ ttft_target_s = 2.0
 tpot_target_ms = 50.0
 # 输出 token 少于此值时 TPOT 不参与判定（避免极短输出的统计噪声）
 min_completion_tokens = 2
+# 门限来源：
+#   absolute          —— 用上方固定值，业务契约口径，跨次运行可比，适合验收
+#   baseline_relative —— 由 Phase 0 低压基线各长度桶的 p99 × 系数生成，可自动适配
+#                        不同推理引擎/模型规模；换引擎后重测基线即可，曲线自动平移
+# 两种模式都【不】支持"用本次运行观测到的分位数定标"：那会让门限随压力同步抬升，
+# SLO 恒约等于目标值，指标失去分辨力、无法验收。
+target_mode = "absolute"
+# 仅 baseline_relative 生效：门限 = 该长度桶基线 p99 × 系数。必须 >= 1.0
+ttft_factor = 3.0
+tpot_factor = 2.0
 
 [load]
 # closed = 闭环固定并发（推荐，用于探测 Router 缓冲/拒绝边界）
@@ -29,8 +39,11 @@ min_completion_tokens = 2
 mode = "closed"
 # 递增并发梯度：由低压到高压逐级施压，建议覆盖预期拐点两侧
 concurrency_steps = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
-# 每级稳压时长（秒）；样本不足时调大
+# 每级稳压时长（秒）；闭环低压级别样本产出受单请求 E2E 限制，样本不足会自动延长
 stage_duration_s = 60.0
+# 每级稳压时长的自适应上限（秒）：测量段样本不足 min_samples_per_stage 时逐级延长至此为止，
+# 防止"并发 1、E2E≈3.5s 时 60s 仅 17 个样本"导致低压优质级别被整体排除在容量判定外
+max_stage_duration_s = 300.0
 # 每级预热时长（秒），预热数据不计入统计
 warmup_s = 10.0
 # 闭环模式下每次请求前的思考时间（秒）
@@ -38,11 +51,25 @@ think_time_s = 0.0
 # 每级请求数上限（防止高压级样本爆炸）；预热段单独计数
 max_requests_per_stage = 5000
 max_warmup_requests_per_stage = 5000
-# 到点后在途请求的最大等待（秒）
-drain_timeout_s = 60.0
+# 到点后在途请求的最大等待（秒）：需大于最长 E2E，否则最慢的请求会被记为"放弃"
+# （aborted）而不计入统计，造成时延低估
+drain_timeout_s = 120.0
 # 仅 open 模式生效
 target_rps = 0.0
 max_inflight = 4096
+# ---- Phase 0 基线剖析 ----
+# 正式 ramp 之前，先用低压并发测一次"无压力时的服务时延"，产出各长度桶的
+# TTFT/TPOT 分位数。仅当 slo.target_mode=baseline_relative 时其分位数才参与
+# 门限计算；absolute 模式下也会执行（报告的"质量退化率"诊断表需要它）。
+# 基线只统计分位数与失败数，不对 A2/A3 判定——基线是尺子的来源，
+# 再拿它判达标会形成循环论证。
+baseline_enabled = true
+# 基线并发：必须低到不触发排队/拒绝，且小于最小的 concurrency_step
+baseline_concurrency = 1
+# 基线时长：需保证每个长度桶都有足量样本（>= analysis.min_samples_per_stage），
+# 否则该桶门限回退为 absolute 配置值并在报告中标注
+baseline_duration_s = 30.0
+baseline_warmup_s = 5.0
 
 [requests]
 # prompt 长度目标（token）分布，需与 max_context_tokens 匹配
@@ -60,14 +87,23 @@ unique_prefix = true
 seed = 20241030
 # 无 tokenizer 时的字符/token 估算比（中英文混合约 3.5；真实值以 usage 为准并可在报告中复盘）
 chars_per_token = 3.5
+# prompt 长度分桶上界（token，左开右闭）；桶数 = 上界个数 + 1，最后一个桶无上界。
+# 例 [1024, 4096] → ≤1024 / 1025-4096 / >4096 三桶。
+# 分桶的意义：TTFT 与 prompt 长度强相关（prefill 计算量近似线性），全局单门限会让
+# 长 prompt 请求天然落入 A3，把"长度差异"混进"排队劣化"里。分桶后每个桶有独立
+# 门限（baseline_relative）或统一门限（absolute），A3 归因才能回答"是所有长度都
+# 劣化，还是只有长 prompt 劣化"。
+length_buckets = [1024, 4096]
 
 [analysis]
-# SLA 目标：A2+A3 占比；0.999 即 3 个 9
+# SLA 目标：A2+A3 占比；0.999 即 3 个 9。仅表示"接得住"
 sla_target = 0.999
-# SLO 目标：A2 占比
+# SLO 目标：A2 占比。表示"接得好"；生产并发建议以两者同时达标的"质量容量"为准
 slo_target = 0.95
-# 样本少于此值的压力级不参与容量判定
-min_samples_per_stage = 100
+# 样本少于此值的压力级不参与高置信度容量判定（仅作低置信度参考容量）。
+# 闭环模式下请结合 max_stage_duration_s 评估可达性：并发 1、E2E≈3.5s 时
+# 300s 约产出 85 个样本
+min_samples_per_stage = 60
 
 [storage]
 # 留空则自动生成 results/bench_<时间戳>.db

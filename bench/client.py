@@ -30,6 +30,7 @@ KIND_STREAM_ERROR = "stream_error"    # 流内错误事件
 KIND_INCOMPLETE = "incomplete"        # 流异常结束且无内容
 KIND_EMPTY = "empty_completion"       # 成功但 0 输出 token
 KIND_PROTOCOL = "protocol_error"      # 响应解析失败
+KIND_ABORTED = "aborted"              # 本级结束时仍在途、被放弃的请求（不计入 A1/A2/A3）
 
 
 @dataclass

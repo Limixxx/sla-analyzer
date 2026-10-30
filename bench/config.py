@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,10 +36,24 @@ class ServiceConfig:
 
 @dataclass
 class SloConfig:
-    """服务质量判定门限。"""
+    """服务质量判定门限。
 
-    ttft_target_s: float = 2.0        # 首 token 时间目标
-    tpot_target_ms: float = 50.0      # 每输出 token 时间目标
+    target_mode 决定门限从哪来：
+    - ``absolute``（默认）：用下方固定的 ttft_target_s / tpot_target_ms，
+      即业务契约口径，跨次运行可比，适合验收。
+    - ``baseline_relative``：门限由 Phase 0 低负载基线测量的 p99 × 系数得出，
+      按 prompt 长度分桶分别生效，可自动适配不同推理引擎/模型规模。
+      系数是显式配置，结论可复现。
+
+    两种模式都不支持"用本次运行观测到的分位数定标"：那会让门限随压力同步
+    抬升，SLO 恒约等于目标值，指标失去分辨力、无法用于验收。
+    """
+
+    ttft_target_s: float = 2.0        # absolute 模式：首 token 时间目标
+    tpot_target_ms: float = 50.0      # absolute 模式：每输出 token 时间目标
+    target_mode: str = "absolute"     # absolute | baseline_relative
+    ttft_factor: float = 3.0          # baseline_relative：TTFT 门限 = 基线 p99 × 本系数
+    tpot_factor: float = 2.0          # baseline_relative：TPOT 门限 = 基线 p99 × 本系数
     min_completion_tokens: int = 2    # 少于此值时 TPOT 不参与判定
 
 
@@ -54,11 +68,18 @@ class LoadConfig:
     stage_duration_s: float = 60.0    # 每级稳压时间
     warmup_s: float = 10.0            # 每级预热时间（不计入统计）
     think_time_s: float = 0.0         # 闭环模式下每次请求前的思考时间
+    max_stage_duration_s: float = 300.0  # 单级实际上限：样本不足时自适应延长至此为止
     max_requests_per_stage: int = 5000        # 测量段请求数上限
     max_warmup_requests_per_stage: int = 5000 # 预热段请求数上限（与测量段分开，防止预热耗尽配额）
-    drain_timeout_s: float = 60.0     # 到点后在途请求的最大等待
+    drain_timeout_s: float = 120.0    # 到点后在途请求的最大等待（分钟级请求需大于最长 E2E）
     target_rps: float = 0.0           # 仅 open 模式
     max_inflight: int = 4096          # 仅 open 模式
+    # Phase 0 基线剖析：在正式 ramp 之前用低压并发测一次"无压力时的服务时延"，
+    # 仅当 slo.target_mode=baseline_relative 时其分位数才参与门限计算。
+    baseline_enabled: bool = True
+    baseline_concurrency: int = 1     # 基线并发，必须低到不触发排队/拒绝
+    baseline_duration_s: float = 30.0
+    baseline_warmup_s: float = 5.0
 
 
 @dataclass
@@ -75,6 +96,11 @@ class RequestConfig:
     unique_prefix: bool = True        # 每请求加唯一前缀，规避前缀缓存干扰
     seed: int = 20241030
     chars_per_token: float = 3.5      # 无 tokenizer 时的字符/token 估算比
+    # prompt 长度分桶上界（token，左开右闭）；桶数 = len+1，最后一个桶无上界。
+    # 例 [1024, 4096] → ≤1024 / 1025-4096 / >4096 三桶。
+    # 分桶的意义：TTFT 与 prompt 长度强相关，全局单门限会让长 prompt 请求
+    # 天然落入 A3，掩盖真正的排队信号。
+    length_buckets: List[int] = field(default_factory=lambda: [1024, 4096])
 
 
 @dataclass
@@ -83,7 +109,11 @@ class AnalysisConfig:
 
     sla_target: float = 0.999         # 3 个 9
     slo_target: float = 0.95
-    min_samples_per_stage: int = 100  # 样本少于此值的级别不参与达标判定
+    min_samples_per_stage: int = 60   # 样本少于此值的级别不参与"达标/不达标"判定
+    # 注意：闭环模式下低并发的样本产出速率受单请求 E2E 限制
+    # （并发 1、E2E≈3.5s 时 60s 仅约 17 个样本），因此 runner 会在
+    # 测量段样本不足时自动延长本级（上限 load.max_stage_duration_s）；
+    # 仍不足的级别以"低置信度参考"进入结论，不直接丢弃。
 
 
 @dataclass
@@ -125,11 +155,20 @@ class Config:
             "stream": self.requests.stream,
             "concurrency_steps": list(self.load.concurrency_steps),
             "stage_duration_s": self.load.stage_duration_s,
+            "max_stage_duration_s": self.load.max_stage_duration_s,
             "warmup_s": self.load.warmup_s,
             "ttft_target_s": self.slo.ttft_target_s,
             "tpot_target_ms": self.slo.tpot_target_ms,
+            "target_mode": self.slo.target_mode,
+            "ttft_factor": self.slo.ttft_factor,
+            "tpot_factor": self.slo.tpot_factor,
+            "length_buckets": list(self.requests.length_buckets),
+            "baseline_enabled": self.load.baseline_enabled,
+            "baseline_concurrency": self.load.baseline_concurrency,
+            "baseline_duration_s": self.load.baseline_duration_s,
             "sla_target": self.analysis.sla_target,
             "slo_target": self.analysis.slo_target,
+            "min_samples_per_stage": self.analysis.min_samples_per_stage,
             "prompt_token_targets": list(self.requests.prompt_token_targets),
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
@@ -178,6 +217,18 @@ def _int_list(mapping: Dict[str, Any], key: str, where: str) -> Optional[List[in
     return list(raw)
 
 
+def _field_default(cls: type, name: str) -> Any:
+    """取 dataclass 字段的默认值。
+
+    不能写成 `cls.name`：带 default_factory 的字段在类上没有该属性
+    （只有配置里显式写了对应键、走 `or` 短路时才会掩盖这个错误）。
+    """
+    f = cls.__dataclass_fields__[name]
+    if f.default_factory is not MISSING:
+        return f.default_factory()
+    return f.default
+
+
 def load_config(path: str) -> Config:
     p = Path(path)
     if not p.exists():
@@ -215,16 +266,22 @@ def load_config(path: str) -> Config:
     slo = SloConfig(
         ttft_target_s=_optional(slo_raw, "ttft_target_s", SloConfig.ttft_target_s, float, "slo"),
         tpot_target_ms=_optional(slo_raw, "tpot_target_ms", SloConfig.tpot_target_ms, float, "slo"),
+        target_mode=_optional(slo_raw, "target_mode", SloConfig.target_mode, str, "slo"),
+        ttft_factor=_optional(slo_raw, "ttft_factor", SloConfig.ttft_factor, float, "slo"),
+        tpot_factor=_optional(slo_raw, "tpot_factor", SloConfig.tpot_factor, float, "slo"),
         min_completion_tokens=_optional(slo_raw, "min_completion_tokens", SloConfig.min_completion_tokens, int, "slo"),
     )
 
-    steps = _int_list(load_raw, "concurrency_steps", "load") or list(LoadConfig.concurrency_steps)
+    steps = _int_list(load_raw, "concurrency_steps", "load") or _field_default(LoadConfig, "concurrency_steps")
     load = LoadConfig(
         mode=_optional(load_raw, "mode", "closed", str, "load"),
         concurrency_steps=sorted(set(steps)),
         stage_duration_s=_optional(load_raw, "stage_duration_s", LoadConfig.stage_duration_s, float, "load"),
         warmup_s=_optional(load_raw, "warmup_s", LoadConfig.warmup_s, float, "load"),
         think_time_s=_optional(load_raw, "think_time_s", LoadConfig.think_time_s, float, "load"),
+        max_stage_duration_s=_optional(
+            load_raw, "max_stage_duration_s", LoadConfig.max_stage_duration_s, float, "load"
+        ),
         max_requests_per_stage=_optional(load_raw, "max_requests_per_stage", LoadConfig.max_requests_per_stage, int, "load"),
         max_warmup_requests_per_stage=_optional(
             load_raw, "max_warmup_requests_per_stage", LoadConfig.max_warmup_requests_per_stage, int, "load"
@@ -232,21 +289,35 @@ def load_config(path: str) -> Config:
         drain_timeout_s=_optional(load_raw, "drain_timeout_s", LoadConfig.drain_timeout_s, float, "load"),
         target_rps=_optional(load_raw, "target_rps", 0.0, float, "load"),
         max_inflight=_optional(load_raw, "max_inflight", LoadConfig.max_inflight, int, "load"),
+        baseline_enabled=_optional(load_raw, "baseline_enabled", LoadConfig.baseline_enabled, bool, "load"),
+        baseline_concurrency=_optional(
+            load_raw, "baseline_concurrency", LoadConfig.baseline_concurrency, int, "load"
+        ),
+        baseline_duration_s=_optional(
+            load_raw, "baseline_duration_s", LoadConfig.baseline_duration_s, float, "load"
+        ),
+        baseline_warmup_s=_optional(
+            load_raw, "baseline_warmup_s", LoadConfig.baseline_warmup_s, float, "load"
+        ),
     )
 
     requests = RequestConfig(
         prompt_token_targets=_int_list(req_raw, "prompt_token_targets", "requests")
-        or list(RequestConfig.prompt_token_targets),
-        prompt_weights=_num_list(req_raw, "prompt_weights", "requests") or list(RequestConfig.prompt_weights),
+        or _field_default(RequestConfig, "prompt_token_targets"),
+        prompt_weights=_num_list(req_raw, "prompt_weights", "requests")
+        or _field_default(RequestConfig, "prompt_weights"),
         max_context_tokens=_optional(req_raw, "max_context_tokens", RequestConfig.max_context_tokens, int, "requests"),
         output_token_choices=_int_list(req_raw, "output_token_choices", "requests")
-        or list(RequestConfig.output_token_choices),
-        output_weights=_num_list(req_raw, "output_weights", "requests") or list(RequestConfig.output_weights),
+        or _field_default(RequestConfig, "output_token_choices"),
+        output_weights=_num_list(req_raw, "output_weights", "requests")
+        or _field_default(RequestConfig, "output_weights"),
         temperature=_optional(req_raw, "temperature", RequestConfig.temperature, float, "requests"),
         stream=_optional(req_raw, "stream", RequestConfig.stream, bool, "requests"),
         unique_prefix=_optional(req_raw, "unique_prefix", RequestConfig.unique_prefix, bool, "requests"),
         seed=_optional(req_raw, "seed", RequestConfig.seed, int, "requests"),
         chars_per_token=_optional(req_raw, "chars_per_token", RequestConfig.chars_per_token, float, "requests"),
+        length_buckets=_int_list(req_raw, "length_buckets", "requests")
+        or _field_default(RequestConfig, "length_buckets"),
     )
 
     analysis = AnalysisConfig(
@@ -295,6 +366,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("load.warmup_s 不能为负")
     if l.warmup_s >= l.stage_duration_s:
         raise ConfigError("load.warmup_s 必须小于 load.stage_duration_s")
+    if l.max_stage_duration_s < l.stage_duration_s:
+        raise ConfigError("load.max_stage_duration_s 不能小于 load.stage_duration_s")
     if l.max_requests_per_stage <= 0:
         raise ConfigError("load.max_requests_per_stage 必须为正数")
     if l.max_warmup_requests_per_stage <= 0:
@@ -328,6 +401,37 @@ def validate(cfg: Config) -> None:
         raise ConfigError("analysis.slo_target 必须在 (0, 1] 区间")
     if a.min_samples_per_stage <= 0:
         raise ConfigError("analysis.min_samples_per_stage 必须为正数")
+
+    # --- SLO 门限来源 ---
+    if cfg.slo.target_mode not in ("absolute", "baseline_relative"):
+        raise ConfigError(
+            f"slo.target_mode 仅支持 absolute / baseline_relative: {cfg.slo.target_mode}"
+        )
+    if cfg.slo.ttft_factor < 1.0 or cfg.slo.tpot_factor < 1.0:
+        raise ConfigError("slo.ttft_factor / tpot_factor 必须 >= 1.0（小于 1 会把正常请求判为不达标）")
+    if cfg.slo.target_mode == "baseline_relative" and not l.baseline_enabled:
+        raise ConfigError("slo.target_mode=baseline_relative 时 load.baseline_enabled 不能为 false")
+
+    # --- Phase 0 基线参数 ---
+    if l.baseline_concurrency <= 0:
+        raise ConfigError("load.baseline_concurrency 必须为正整数")
+    if l.baseline_duration_s <= 0:
+        raise ConfigError("load.baseline_duration_s 必须为正数")
+    if l.baseline_warmup_s < 0:
+        raise ConfigError("load.baseline_warmup_s 不能为负")
+    if l.baseline_warmup_s >= l.baseline_duration_s:
+        raise ConfigError("load.baseline_warmup_s 必须小于 load.baseline_duration_s")
+    if l.baseline_concurrency >= min(l.concurrency_steps) and l.baseline_enabled:
+        # 不阻断：用户可能刻意如此；但基线会含排队，p99 虚高导致门限虚松
+        pass
+
+    # --- 长度分桶 ---
+    if not r.length_buckets:
+        raise ConfigError("requests.length_buckets 不能为空（至少需要一个上界，或显式配置）")
+    if any(b <= 0 for b in r.length_buckets):
+        raise ConfigError("requests.length_buckets 必须全为正整数")
+    if any(b2 <= b1 for b1, b2 in zip(r.length_buckets, r.length_buckets[1:])):
+        raise ConfigError("requests.length_buckets 必须严格递增")
 
     if cfg.slo.ttft_target_s <= 0 or cfg.slo.tpot_target_ms <= 0:
         raise ConfigError("slo.ttft_target_s / tpot_target_ms 必须为正数")

@@ -1,0 +1,4 @@
+results/*.log
+results/*.md
+results/*.db
+__pycache__/
