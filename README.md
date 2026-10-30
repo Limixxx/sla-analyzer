@@ -16,7 +16,7 @@ SLA 与 SLO，并评估达到 **3 个 9 可用性（99.9%）** 所能承受的�
 
 | 类别 | 定义 |
 | --- | --- |
-| **A1** | 失败请求：HTTP 错误（含 Router 过载拒绝 429/503）、连接失败、整体超时、流内错误、空输出 |
+| **A1** | 失败请求：HTTP 错误（含 Router 过载拒绝 429/503）、连接失败、整体超时、流内错误、空输出。Router 配无限队列时过载无 429/529、只表现为客户端超时——分类上仍是 A1，归因上按拒绝族/超时族区分（见 [docs/05](docs/05-watermark.md) 2.1） |
 | **A2** | 成功请求，且 **TTFT ≤ 门限** 且 **TPOT ≤ 门限**（门限可按 prompt 长度分桶，见第 5 章） |
 | **A3** | 成功请求，但不满足 TTFT / TPOT 门限（"慢但成功"） |
 
@@ -48,6 +48,7 @@ benchmark/
 ├── mock_server.py            # 本地模拟推理服务（工具自测用，不用于生产）
 ├── config.example.toml       # 完整配置示例（复制为 config.toml 修改）
 ├── config.mock-demo.toml     # 配合 mock_server 的自测配置（长度参数留空走自动推导）
+├── config.mock-infinite-queue.toml  # 无限队列场景自测（无 429/529，过载投影为客户端超时）
 ├── requirements.txt          # 零依赖说明
 ├── bench/                    # 核心包
 │   ├── config.py             #   配置加载、校验与长度参数自动推导
@@ -144,7 +145,8 @@ python bench.py --qos-model results/qos_model.npz \
    absolute 模式下也执行（供报告的质量退化率诊断表使用）。基线只统计、不判定。
 1. **递增并发**：按 `concurrency_steps` 从低压到高压逐级施压，每级分预热段与测量段
    （预热数据不计入统计）。闭环（closed）模式下每个 worker 串行发请求，
-   并发升高时后端饱和会依次表现为：排队（TTFT/TPOT 抬升 → A3 增多）→ 拒绝（A1 增多），
+   并发升高时后端饱和会依次表现为：排队（TTFT/TPOT 抬升 → A3 增多）→ 失败
+   （A1 增多：拒绝型部署投影为 429/503，无限队列部署投影为客户端超时），
    这正是试探系统容量边界的方式。
 2. **请求特征合成**：按权重采样 prompt 长度与输出长度，附加唯一前缀规避前缀缓存；
    真实 token 数以服务端 `usage` 字段为准（落库 `token_source=usage`），
@@ -229,7 +231,7 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 | --- | --- | --- |
 | NORMAL | 各项可观测指标均在软门限之内 | 资源有余量 |
 | BUSY（软水位投影） | A3 占比 ≥ `soft_slo_violation_ratio`（默认 5%），或 TTFT p99 ≥ `soft_ttft_p99_ms`（0=关闭） | 转入排队/路由分流，不拒绝 |
-| OVERLOAD（硬水位投影） | A1 占比 ≥ `hard_reject_ratio`（默认 1%），或 A3 占比 ≥ `hard_slo_violation_ratio`（默认 50%） | 拒绝接入（429/503） |
+| OVERLOAD（硬水位投影） | A1 占比 ≥ `hard_reject_ratio`（默认 1%），或 A3 占比 ≥ `hard_slo_violation_ratio`（默认 50%） | 拒绝接入（429/503）；无限队列部署下为排队耗尽、客户端超时 |
 | unknown | 本级无完成样本 | 无法判定，不参与边界发现 |
 
 报告给出三个水位边界：**软水位并发**（首个 BUSY 级，排队预警线）、
@@ -289,7 +291,7 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 | `watermark.enabled` | 是否判定水位状态 | 关闭后分级表无"水位"列、结论区无水位边界陈述（其余结论不受影响） |
 | `watermark.soft_slo_violation_ratio` | 软水位（BUSY）门限：A3 占比 | 默认 5%；调小更早预警排队，调大更保守 |
 | `watermark.hard_slo_violation_ratio` | 硬水位（OVERLOAD）门限：A3 占比 | 默认 50%（过半不达标 = 质量崩塌） |
-| `watermark.hard_reject_ratio` | 硬水位（OVERLOAD）门限：A1 占比 | 默认 1%；服务端限流不会零星出现 |
+| `watermark.hard_reject_ratio` | 硬水位（OVERLOAD）门限：A1 占比 | 默认 1%；服务端限流/排队耗尽不会零星出现（含客户端超时族） |
 | `watermark.soft_ttft_p99_ms` | 软水位附加门限：TTFT p99 绝对值 | 默认 0（关闭）；开启后在 A3 尚少时提前报 BUSY，跨引擎对比时记得调整 |
 | `qos_model.enabled` | 是否训练 MLP 预测模型 | 开启后压测结束自动训练并写 `.npz`；样本不足时跳过并在报告说明 |
 | `qos_model.min_samples` | 最低训练样本量 | 默认 200；低于此值模型不可信，宁可不训 |
@@ -354,6 +356,21 @@ prompt 长度分布与长度分桶均**留空**——用于验证按上下文上
 （门限 `analysis.baseline_min_samples`），样本仍不足的桶回退 absolute
 并在日志中给出"还差多少/约需多久/建议并发"的量化提示。
 
+**无限队列场景自测**（Router 无队列上限：无 429/529，过载投影为客户端超时）：
+
+```bash
+# 终端 1：无限队列模式（排队随超出量无上限增长，客户端先触达 timeout_s）
+python mock_server.py --port 8123 --infinite-queue --queue-step-s 2.0 --soft-capacity 8
+
+# 终端 2：客户端预算压到 10s，高压级全部客户端超时
+python bench.py --config config.mock-infinite-queue.toml
+```
+
+预期：并发 ≤ 8 全部 NORMAL；并发 12 排队 ≈8s、成功但 TTFT 超标（BUSY）；
+并发 ≥ 16 排队超 10s 预算，**全程无一条 429/503**，失败全部是 `timeout`
+（A1 超时族）并触发 OVERLOAD。报告的过载形态、水位触发原因与治理建议
+应按"排队型"而非"拒绝型"归因（见 [docs/05-watermark.md](docs/05-watermark.md) 2.1）。
+
 ## 9. 使用注意与局限
 
 - **超时口径**：`timeout_s` 是单请求整体超时。分钟级请求下若设小了，慢请求会被记为
@@ -367,13 +384,19 @@ prompt 长度分布与长度分桶均**留空**——用于验证按上下文上
   必要时把压测客户端部署到靠近服务的网络位置。
 - **排队型过载陷阱**：若服务过载时只排队不拒绝（A1=0、TTFT 持续抬升），
   SLA 会一直"达标"——此时请直接看 SLO 与质量容量结论，不要用 SLA 容量定生产并发。
+  其极端变体是 **Router 无限队列**：服务永不拒绝，客户端先超时（A1 的 timeout 族
+  堆积、全程无 429/529）。此时 SLA 同样断崖，但治理动作不是调高 `timeout_s`
+  （那只会把可用性问题藏起来），而是给队列设上限/排队超时让过载可被观测
+  （见 [docs/05-watermark.md](docs/05-watermark.md) 2.1）。
 - **前缀缓存**：`unique_prefix=true` 会加少量 token 换取无缓存干扰的 TTFT；
   若生产有关键前缀缓存优化，可关闭以测量"热"路径。
 - **单机压力上限**：单进程闭环压测建议到数百并发；更高压力可多机运行、
   各自写独立 db 后合并 `requests` 表分析。
 - **Router 行为依赖**：A1 中的 rejected 依赖 Router 返回 429/503（或报文含
   overload/queue full 字样）；若部署的 Router 用其他状态码表达过载，
-  请在 `bench/client.py` 的失败分类处补充。
+  请在 `bench/client.py` 的失败分类处补充。若 Router 配无限队列不过载拒绝，
+  过载会表现为客户端超时（timeout 族），工具按 A1 正常统计并在报告中
+  给出排队型归因，无需改代码。
 - **baseline_relative 的横向对比边界**：该口径下"达标"只对当次基线有意义——
   跨引擎/跨模型比较时应改用 absolute 口径（或并列两种口径），只对比报告中
   与门限无关的**质量退化率**与原始分位数。

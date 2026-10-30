@@ -11,7 +11,7 @@ from . import metrics
 from . import qos as qos_mod
 from .baseline import BaselineResult, Thresholds, bucket_label, bucket_of
 from .config import Config
-from .metrics import CapacityFinding, StageStats, WatermarkFinding
+from .metrics import CapacityFinding, StageStats, WatermarkFinding, split_fail_kinds
 from .qos import (
     BoundaryScan,
     MixPoint,
@@ -369,8 +369,8 @@ def _render_qos_section(
         ))
         lines.append("")
         lines.append("> 预测为该并发实际流量构成下的桶加权值；分位数由折外残差 ECDF 校准。")
-        lines.append("> **口径说明**：实测 SLO 的分母含 A1（被拒绝的请求拉低实测值），"
-                     "而预测只回答\"成功请求的质量\"——两者在高并发拒绝区必然分叉，"
+        lines.append("> **口径说明**：实测 SLO 的分母含 A1（被拒绝或客户端超时的请求拉低实测值），"
+                     "而预测只回答\"成功请求的质量\"——两者在高并发过载区必然分叉，"
                      "这是语义差异而非模型误差；⚠ 标记仅提示偏离幅度，"
                      "低并发区的偏离才真正反映模型精度。")
     else:
@@ -448,16 +448,16 @@ def _render_qos_section(
         f"并发 {measured_collapse}" if measured_collapse is not None else "未触达"
     )
     hard_measured_txt = (
-        f"；A1 拒绝型硬水位实测 {measured_hard}"
+        f"；A1 失败型硬水位实测 {measured_hard}"
         if measured_hard is not None else ""
     )
     lines.append(f"- 预测硬水位-质量崩塌（A3 占比 ≥ {cfg.watermark.hard_slo_violation_ratio:.0%}）："
                  f"{hard_txt}（实测质量崩塌 {collapse_txt}{hard_measured_txt}）")
     lines.append(f"- 预测质量容量（SLO ≥ {cfg.analysis.slo_target:.0%} 连续前缀，"
                  f"**仅质量口径**）：{cap_txt}"
-                 "（实测容量还要求 SLA 达标，含拒绝影响，两者在拒绝区分叉属预期）")
-    lines.append("- A1 驱动的硬水位（拒绝率）**不在模型能力内**：模型只预测成功请求的质量，"
-                 "不预测失败/拒绝概率，该边界以实测为准。")
+                 "（实测容量还要求 SLA 达标，含失败（拒绝/超时）影响，两者在过载区分叉属预期）")
+    lines.append("- A1 驱动的硬水位（失败率，含拒绝与客户端超时）**不在模型能力内**："
+                 "模型只预测成功请求的质量，不预测失败概率，该边界以实测为准。")
     lines.append("")
 
     # ---- 9.4 模型文件 ----
@@ -597,7 +597,7 @@ def build_conclusions(
                 f"{watermark.hard_watermark_concurrency} 起"
             )
         else:
-            parts.append("已测梯度内未触达硬水位投影（OVERLOAD，无拒绝/无质量崩塌）")
+            parts.append("已测梯度内未触达硬水位投影（OVERLOAD，无 A1 失败/无质量崩塌）")
         if watermark.sla_watermark_concurrency is not None:
             parts.append(
                 f"SLA 水位（业务目标口径）= 并发 {watermark.sla_watermark_concurrency}"
@@ -610,7 +610,25 @@ def build_conclusions(
         knee = by_conc.get(finding.knee_concurrency)
         if knee is not None:
             if knee.a1 > 0:
-                shape = f"出现失败请求（A1={knee.a1}），Router 进入过载拒绝区"
+                # A1 的家族构成决定"过载长什么样"：拒绝族 ⇒ 服务端明确回绝；
+                # 超时族 ⇒ 服务不拒绝但预算内完不成（Router 无限队列的投影）。
+                timeout_n, reject_n, other_n = knee.a1_families()
+                if timeout_n > 0 and timeout_n >= reject_n:
+                    shape = (
+                        f"出现失败请求（A1={knee.a1}，其中客户端超时 {timeout_n} 条），"
+                        "Router 不拒绝但请求无法在预算内完成"
+                        "（疑似无限队列/排队耗尽，过载形态为排队型）"
+                    )
+                elif reject_n > 0:
+                    shape = (
+                        f"出现失败请求（A1={knee.a1}，其中服务端拒绝 {reject_n} 条），"
+                        "Router 进入过载拒绝区"
+                    )
+                else:
+                    shape = (
+                        f"出现失败请求（A1={knee.a1}，连接/流中断类 {other_n} 条），"
+                        "过载表现为连接被切而非明确拒绝"
+                    )
             else:
                 shape = f"请求全部成功但时延超标（A3={knee.a3}），过载表现为排队而非拒绝"
             lines.append(
@@ -676,6 +694,17 @@ def build_recommendations(
                 "存在整体超时：请核对 service.timeout_s 是否覆盖最长合法请求（分钟级），"
                 "以及是否存在请求被无限期挂起。"
             )
+        # 无限队列部署的识别：全程无 429/529 拒绝，失败以客户端超时为主。
+        # 此时过载不投影为拒绝而投影为超时（仍计 A1、拉低 SLA），
+        # 若生产同样如此，可用性危机会被转嫁为客户端超时。
+        timeout_total, reject_total, _other = split_fail_kinds(kinds)
+        if reject_total == 0 and timeout_total > 0 and timeout_total >= total_fail / 2:
+            recs.append(
+                "失败以客户端超时为主且全程无 429/529 拒绝：Router 可能配置了无限队列——"
+                "过载不投影为拒绝而投影为客户端超时（仍计入 A1、拉低 SLA）。"
+                "若生产部署同样如此，建议服务侧配置队列上限/排队超时让过载可被观测，"
+                "或客户端设置合理超时预算并配合熔断/退避，避免可用性问题被无限队列隐藏。"
+            )
 
     # A3 归因
     a3_total = sum(s.a3 for s in stages)
@@ -716,7 +745,7 @@ def build_recommendations(
             )
         if sum(s.a1 for s in stages) == 0:
             recs.append(
-                "本次过载全程无拒绝请求（A1=0），压力全部由排队消化：TTFT 随并发持续抬升"
+                "本次过载全程无失败请求（A1=0），压力全部由排队消化：TTFT 随并发持续抬升"
                 "是主要矛盾，容量结论应以 SLO（质量）而非 SLA（可用性）为准。"
             )
 
@@ -762,19 +791,40 @@ def build_recommendations(
             hard = next((c for c in sorted(states) if states[c] == "OVERLOAD"), None)
             if hard is not None:
                 hard_stage = next(s for s in stages if s.concurrency == hard)
-                shape = (
-                    f"出现拒绝（A1={hard_stage.a1}/{hard_stage.n_total}）"
-                    if hard_stage.a1 > 0
-                    else f"质量崩塌（A3={hard_stage.a3}/{hard_stage.n_total}）"
-                )
+                if hard_stage.a1 > 0:
+                    timeout_n, reject_n, _other = hard_stage.a1_families()
+                    if timeout_n > 0 and timeout_n >= reject_n:
+                        shape = (
+                            f"客户端超时：A1={hard_stage.a1}/{hard_stage.n_total}，"
+                            f"超时族 {timeout_n} 条"
+                        )
+                        ops = (
+                            "该并发起请求无法在客户端预算内完成（Router 不拒绝但排队耗尽，"
+                            "疑似无限队列）：建议将 Router 队列上限/排队超时/熔断线设在该并发之下"
+                            "并预留余量——无限队列部署需先给队列设上限，否则过载只表现为客户端超时、"
+                            "无法被拒绝类监控发现；治理方向为扩容 PD 副本或提高准入并发。"
+                        )
+                    else:
+                        shape = (
+                            f"服务端拒绝：A1={hard_stage.a1}/{hard_stage.n_total}，"
+                            f"拒绝族 {reject_n} 条"
+                        )
+                        ops = (
+                            "建议将 Router 拒绝阈值/熔断线设在该并发之下并预留余量；"
+                            "治理方向为扩容 PD 副本或提高准入并发，而非单纯调高拒绝阈值。"
+                        )
+                else:
+                    shape = f"质量崩塌：A3={hard_stage.a3}/{hard_stage.n_total}"
+                    ops = (
+                        "建议将该并发作为熔断线并预留余量；"
+                        "治理方向为扩容 PD 副本或提高准入并发。"
+                    )
                 recs.append(
-                    f"水位运维建议：硬水位投影出现在并发 {hard}（{shape}），"
-                    "建议将 Router 拒绝阈值/熔断线设在该并发之下并预留余量；"
-                    "治理方向为扩容 PD 副本或提高准入并发，而非单纯调高拒绝阈值。"
+                    f"水位运维建议：硬水位投影出现在并发 {hard}（{shape}）。{ops}"
                 )
             elif soft is not None:
                 recs.append(
-                    f"水位运维建议：软水位投影出现在并发 {soft}（开始排队但未拒绝），"
+                    f"水位运维建议：软水位投影出现在并发 {soft}（开始排队，尚无失败），"
                     "建议将该并发作为 Router 排队预警线（触发告警/扩容评估），"
                     "并把生产并发控制在质量容量之内以远离排队区。"
                 )
@@ -785,7 +835,7 @@ def build_recommendations(
                 )
 
     recs.append(
-        "口径提醒：本报告的 SLA/SLO 为全请求口径（含被 Router 拒绝的 A1）；"
+        "口径提醒：本报告的 SLA/SLO 为全请求口径（含被拒绝或客户端超时的 A1）；"
         "若需“成功请求口径”的时延分布，可查询 DB 中 status='ok' 的明细。"
     )
     return recs
@@ -850,7 +900,8 @@ def render_report(
     if cfg.watermark.enabled:
         lines.append("6. 每级判定水位状态（服务端水位的黑盒投影，见 docs/05-watermark.md）："
                      "NORMAL（无信号）/ BUSY（软水位投影：A3 占比或 TTFT p99 超软门限，"
-                     "服务在排队）/ OVERLOAD（硬水位投影：出现拒绝或 A3 占比超硬门限）；"
+                     "服务在排队）/ OVERLOAD（硬水位投影：出现失败——服务端拒绝或客户端超时"
+                     "（Router 无限队列时过载只投影为超时）——或 A3 占比超硬门限）；"
                      "跨级汇总软/硬/SLA 三个水位边界，分别对应 Router 的排队预警线、"
                      "熔断线与生产并发建议。")
         adaptive_no, baseline_no = "7.", "8."

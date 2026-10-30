@@ -25,7 +25,8 @@ from .prompts import RequestSpec
 KIND_REJECTED = "rejected"            # Router 过载拒绝（429/503）
 KIND_HTTP_4XX = "http_4xx"
 KIND_HTTP_5XX = "http_5xx"
-KIND_TIMEOUT = "timeout"              # 整体超时
+KIND_TIMEOUT = "timeout"              # 整体超时。Router 配无限队列（无 429/529）时，
+                                      # 过载的唯一投影就是这一族——分类上仍是 A1
 KIND_CONNECT_TIMEOUT = "connect_timeout"
 KIND_CONN = "conn_error"              # 连接失败/重置
 KIND_STREAM_ERROR = "stream_error"    # 流内错误事件

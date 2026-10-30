@@ -5,11 +5,16 @@
 - 基础 TTFT / TPOT 时延（可配置）；
 - 在途请求超过 soft_capacity 后，排队等待与 TPOT 随负载抬升（模拟 Router 缓冲）；
 - 在途请求超过 hard_capacity 后直接返回 503（模拟 Router 拒绝）；
+- --infinite-queue：模拟 Router 配置无限队列——不返回 503，排队等待随
+  超出量无上限线性增长（每超出 1 个在途 +queue_step_s 秒）。高压下
+  客户端会先触达自己的 timeout_s，过载投影为"客户端超时"而非拒绝；
 - 支持流式（SSE）与非流式两种响应，末 chunk 带回 usage。
 
 用法：
     python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 \
         --soft-capacity 8 --hard-capacity 12
+    # 无限队列变体（验证 A1 超时族归因）：
+    python mock_server.py --port 8123 --infinite-queue --queue-step-s 2.0
 """
 
 from __future__ import annotations
@@ -36,6 +41,9 @@ class MockState:
         self.tpot_ms = args.tpot_ms
         self.soft_capacity = max(1, args.soft_capacity)
         self.hard_capacity = max(self.soft_capacity, args.hard_capacity)
+        # 无限队列模式：不拒绝，排队时间随超出量无上限增长
+        self.infinite_queue = args.infinite_queue
+        self.queue_step_s = args.queue_step_s
         self.error_rate = args.error_rate
         self.in_flight = 0
         self.lock = asyncio.Lock()
@@ -117,14 +125,20 @@ async def _handle_chat(state: MockState, payload: Dict, writer: asyncio.StreamWr
         state.in_flight += 1
         in_flight = state.in_flight
     try:
-        if in_flight > state.hard_capacity:
+        if in_flight > state.hard_capacity and not state.infinite_queue:
             await _send_sse_error(writer, 503, "router overloaded: worker queue is full")
             return
 
         load = in_flight / float(state.soft_capacity)
         queue_wait_s = 0.0
         tpot_scale = 1.0
-        if load > 1.0:
+        if state.infinite_queue:
+            # 无限队列：排队等待随超出量无上限线性增长，客户端先触达自己的
+            # timeout_s（过载投影为客户端超时而非 429/503）
+            excess = max(0, in_flight - state.soft_capacity)
+            queue_wait_s = excess * state.queue_step_s
+            tpot_scale = 1.0 + excess * 0.5
+        elif load > 1.0:
             # 缓冲区：排队等待与逐 token 时延同时抬升
             queue_wait_s = (load - 1.0) * 0.25
             tpot_scale = 1.0 + (load - 1.0) * 2.0
@@ -234,7 +248,9 @@ async def _serve(args: argparse.Namespace) -> None:
     print(f"[mock] listening on http://{args.host}:{args.port}  "
           f"ttft={args.ttft_ms}ms ttft_per_1k={args.ttft_per_1k_ms}ms tpot={args.tpot_ms}ms "
           f"soft_capacity={state.soft_capacity} hard_capacity={state.hard_capacity} "
-          f"error_rate={args.error_rate}")
+          f"error_rate={args.error_rate} "
+          f"infinite_queue={state.infinite_queue}"
+          + (f" queue_step={state.queue_step_s}s" if state.infinite_queue else ""))
     async with server:
         await server.serve_forever()
 
@@ -249,6 +265,10 @@ def main() -> None:
     parser.add_argument("--tpot-ms", type=float, default=15.0)
     parser.add_argument("--soft-capacity", type=int, default=8, help="超过后开始排队/降速")
     parser.add_argument("--hard-capacity", type=int, default=12, help="超过后直接 503 拒绝")
+    parser.add_argument("--infinite-queue", action="store_true",
+                        help="无限队列模式：不返回 503，排队随超出量无上限增长（客户端先超时）")
+    parser.add_argument("--queue-step-s", type=float, default=2.0,
+                        help="无限队列模式下每超出 1 个在途请求的排队秒数")
     parser.add_argument("--error-rate", type=float, default=0.0)
     args = parser.parse_args()
     try:

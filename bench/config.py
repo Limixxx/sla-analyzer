@@ -115,14 +115,18 @@ class WatermarkConfig:
     推理水位分三层：软水位（BUSY，转入排队不拒绝）、硬水位（OVERLOAD，
     直接拒绝）、SLA 水位（业务承诺）。压测工具是黑盒客户端，看不到
     KV Cache / 批 slot / GPU 等服务端资源指标，因此这里判定的是
-    **可观测投影**：服务端排队 → TTFT 抬升、A3 增多；服务端拒绝 → A1 增多。
+    **可观测投影**：服务端排队 → TTFT 抬升、A3 增多；服务端拒绝 → A1
+    （拒绝族）增多；服务端配无限队列时不拒绝，过载投影为客户端超时 →
+    A1（超时族）增多。两种 A1 都算"接不住"，均触发硬水位，归因见
+    metrics.split_fail_kinds。
     OR 逻辑（任一硬条件触发即 OVERLOAD），优先级 OVERLOAD > BUSY > NORMAL。
     """
 
     enabled: bool = True
     soft_slo_violation_ratio: float = 0.05   # A3 占比 ≥ 此值 → 软水位 BUSY（排队预警）
     hard_slo_violation_ratio: float = 0.50   # A3 占比 ≥ 此值 → 硬水位 OVERLOAD（质量崩塌）
-    hard_reject_ratio: float = 0.01          # A1 占比 ≥ 此值 → 硬水位 OVERLOAD（服务在拒绝）
+    hard_reject_ratio: float = 0.01          # A1 占比 ≥ 此值 → 硬水位 OVERLOAD
+                                              # （服务拒绝，或无限队列下排队耗尽投影为客户端超时）
     soft_ttft_p99_ms: float = 0.0            # >0 时 TTFT p99 超此值也判 BUSY；0=关闭
 
 

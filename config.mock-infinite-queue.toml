@@ -1,0 +1,75 @@
+# 自测配置：验证"Router 无限队列"场景——无 429/529，过载投影为客户端超时。
+# 用法：
+#   python mock_server.py --port 8123 --infinite-queue --queue-step-s 2.0 \
+#       --soft-capacity 8
+#   python bench.py --config config.mock-infinite-queue.toml
+#
+# 场景原理：mock 在 infinite-queue 模式下不返回 503，排队等待 = 超出
+# soft_capacity 的在途数 × queue_step_s（无上限）。本配置把客户端预算
+# service.timeout_s 压到 10s，于是：
+#   并发 ≤ 8   ：无排队，请求快速成功          → NORMAL
+#   并发 12    ：排队 ≈ 8s，成功但 TTFT 超标    → BUSY（A3 软水位投影）
+#   并发 ≥ 16  ：排队 ≥ 16s > 10s 预算         → OVERLOAD（A1 超时族）
+# 全程没有任何 429/503：过载以"客户端超时"形式出现，但分类上仍是 A1、
+# 仍拉低 SLA、仍触发硬水位——报告的归因（排队型 vs 拒绝型）应体现这一点。
+#
+# 对照实验（拒绝型）：把 mock 换成 --hard-capacity 12（去掉 --infinite-queue），
+# 同一配置重跑，对比报告的过载形态与水位运维建议差异。
+
+[service]
+base_url = "http://127.0.0.1:8123"
+api_key = ""
+path = "/v1/chat/completions"
+model = "mock-model"
+# 客户端预算：无限队列场景下这是"过载何时可观测"的旋钮
+timeout_s = 10.0
+connect_timeout_s = 5.0
+verify_tls = false
+
+[slo]
+ttft_target_s = 1.0
+tpot_target_ms = 40.0
+min_completion_tokens = 2
+target_mode = "absolute"
+ttft_factor = 3.0
+tpot_factor = 2.0
+
+[load]
+mode = "closed"
+concurrency_steps = [1, 2, 4, 8, 12, 16, 20, 24]
+stage_duration_s = 12.0
+max_stage_duration_s = 30.0
+warmup_s = 3.0
+think_time_s = 0.0
+max_requests_per_stage = 800
+drain_timeout_s = 12.0
+
+[requests]
+max_context_tokens = 8192
+output_token_choices = [32, 64]
+output_weights = [0.6, 0.4]
+temperature = 0.7
+stream = true
+unique_prefix = true
+seed = 20241030
+chars_per_token = 3.5
+
+[analysis]
+sla_target = 0.999
+slo_target = 0.9
+min_samples_per_stage = 15
+
+[watermark]
+enabled = true
+soft_slo_violation_ratio = 0.05
+hard_slo_violation_ratio = 0.50
+hard_reject_ratio = 0.01
+
+[qos_model]
+enabled = true
+
+[storage]
+db_path = "results/selfcheck_infinite_queue.db"
+
+[report]
+output_path = "results/selfcheck_infinite_queue_report.md"

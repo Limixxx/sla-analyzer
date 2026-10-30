@@ -5,6 +5,12 @@
 - A2 成功且满足 SLO 的请求：TTFT、TPOT 双双不超出门限
 - A3 成功但不满足 SLO 的请求：其余成功请求
 
+A1 内部按归因家族再分两层（不影响分类本身，只影响"过载长什么样"的解读，
+见 docs/05-watermark.md 无限队列一节）：
+- 超时族 timeout / connect_timeout：请求已被服务接受，但在客户端预算内
+  未完成。Router 配无限队列（无 429/529）时，过载的唯一投影就是这一族；
+- 拒绝族 rejected / http_4xx / http_5xx / stream_error：服务端明确回复错误。
+
 门限可以按 prompt 长度分桶（TTFT 与长度强相关，全局单门限会让长 prompt
 请求天然落入 A3，掩盖真正的排队信号）；门限来源见 bench/baseline.py。
 
@@ -23,8 +29,38 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .baseline import Thresholds, bucket_of, row_tokens
+from .client import (
+    KIND_CONNECT_TIMEOUT,
+    KIND_HTTP_4XX,
+    KIND_HTTP_5XX,
+    KIND_REJECTED,
+    KIND_STREAM_ERROR,
+    KIND_TIMEOUT,
+)
 from .config import AnalysisConfig, SloConfig, WatermarkConfig
 from .stats import mean, percentile
+
+# A1 的归因家族（error_kind 的两类聚合，回答"过载长什么样"）：
+# - 超时族：服务没说"不接"，但请求在客户端预算内没完成。Router 无限队列
+#   （无 429/529）时过载只投影为这一族——分类上仍是 A1，仍拉低 SLA。
+# - 拒绝族：服务端明确回复错误（过载拒绝 / 4xx / 5xx / 流内 error）。
+# 其余 kind（conn_error / incomplete / empty_completion / protocol_error）
+# 归"其他"：可能是排队耗尽后的连接被切，也可能是服务崩溃，不强行归因。
+A1_TIMEOUT_KINDS = frozenset({KIND_TIMEOUT, KIND_CONNECT_TIMEOUT})
+A1_REJECT_KINDS = frozenset({KIND_REJECTED, KIND_HTTP_4XX, KIND_HTTP_5XX, KIND_STREAM_ERROR})
+
+
+def split_fail_kinds(fail_kinds: Dict[str, int]) -> Tuple[int, int, int]:
+    """把 A1 的 error_kind 直方图拆成 (超时族, 拒绝族, 其他)。
+
+    fail_kinds 只含 A1 的 kind（compute_stage_stats 在 A1 分支内填充），
+    因此三者之和恒等于 A1 总数。实时跑与 --report-only（fail_kinds_json
+    重载）走同一函数，归因结论跨路径一致。
+    """
+    timeout_n = sum(c for k, c in fail_kinds.items() if k in A1_TIMEOUT_KINDS)
+    reject_n = sum(c for k, c in fail_kinds.items() if k in A1_REJECT_KINDS)
+    other_n = sum(fail_kinds.values()) - timeout_n - reject_n
+    return timeout_n, reject_n, other_n
 
 
 def classify(
@@ -69,7 +105,8 @@ def classify_watermark(stats: "StageStats", wm: WatermarkConfig) -> Tuple[str, L
     """按黑盒可观测信号判定本级水位状态（watermark.md 三层语义的外部对偶）。
 
     OR 逻辑、优先级 OVERLOAD > BUSY > NORMAL：
-    - OVERLOAD：A1 占比 ≥ hard_reject_ratio（服务在拒绝）或
+    - OVERLOAD：A1 占比 ≥ hard_reject_ratio（服务在拒绝，或无限队列下
+      排队耗尽投影为客户端超时——两种都算"接不住"）或
       A3 占比 ≥ hard_slo_violation_ratio（质量崩塌）；
     - BUSY：A3 占比 ≥ soft_slo_violation_ratio，或（启用时）TTFT p99 ≥
       soft_ttft_p99_ms——排队信号：不拒绝，但时延/质量已劣化；
@@ -78,6 +115,9 @@ def classify_watermark(stats: "StageStats", wm: WatermarkConfig) -> Tuple[str, L
 
     判定只用本级已有的聚合量，不改请求路径；--report-only 从旧库重建时
     同样可判（幂等）。资源级水位（KV/slot/GPU）服务端不可见，不在此列。
+
+    A1 触发硬水位时按归因家族（split_fail_kinds）给出解读：超时族主导
+    ⇒ 排队型过载（Router 疑似无限队列）；拒绝族主导 ⇒ 拒绝型过载。
     """
     if stats.n_total == 0:
         return "unknown", []
@@ -87,10 +127,21 @@ def classify_watermark(stats: "StageStats", wm: WatermarkConfig) -> Tuple[str, L
 
     hard: List[str] = []
     if a1_ratio >= wm.hard_reject_ratio:
+        timeout_n, reject_n, other_n = stats.a1_families()
         hard.append(
-            f"拒绝率 {a1_ratio:.2%} ≥ {wm.hard_reject_ratio:.2%}"
-            f"（A1={stats.a1}/{stats.n_total}）"
+            f"失败率 {a1_ratio:.2%} ≥ {wm.hard_reject_ratio:.2%}"
+            f"（A1={stats.a1}/{stats.n_total}：客户端超时 {timeout_n}、"
+            f"服务端拒绝 {reject_n}、其他 {other_n}）"
         )
+        if timeout_n > reject_n:
+            hard.append(
+                "失败以客户端超时为主：服务不拒绝但无法在预算内完成——"
+                "Router 疑似无限队列/排队耗尽，过载形态为排队型而非拒绝型"
+            )
+        elif reject_n > timeout_n:
+            hard.append(
+                "失败以服务端拒绝为主：过载形态为拒绝型（429/5xx 明确回绝）"
+            )
     if a3_ratio >= wm.hard_slo_violation_ratio:
         hard.append(
             f"质量违约率 {a3_ratio:.2%} ≥ {wm.hard_slo_violation_ratio:.2%}"
@@ -181,6 +232,14 @@ class StageStats:
     @property
     def slo_met(self) -> bool:
         return self.n_total > 0 and self.slo >= self.slo_target
+
+    def a1_families(self) -> Tuple[int, int, int]:
+        """A1 按归因家族拆分：(超时族, 拒绝族, 其他)。
+
+        由 fail_kinds 现场推导（live 与 report-only 一致），不落库——
+        fail_kinds_json 已是充分统计量，避免为派生量加 schema 列。
+        """
+        return split_fail_kinds(self.fail_kinds)
 
     def as_row(self) -> Dict[str, Any]:
         # 只导出标量字段：字典字段（fail_kinds / bucket_stats）另走专用表
@@ -525,7 +584,8 @@ class WatermarkFinding:
 
     三个边界回答三个运维问题：
     - soft_watermark_concurrency：首个 BUSY 级——排队预警线（Router 队列上限参考）；
-    - hard_watermark_concurrency：首个 OVERLOAD 级——熔断线（拒绝阈值参考）；
+    - hard_watermark_concurrency：首个 OVERLOAD 级——熔断线（拒绝阈值参考；
+      无限队列部署下该点是排队耗尽点，投影为客户端超时）；
     - sla_watermark_concurrency：= 质量容量——生产并发建议（与容量模型同一基准）。
 
     注意这是"水位的可观测投影"：软水位投影略滞后于服务端软水位触达
@@ -589,7 +649,7 @@ def find_watermarks(
     ):
         finding.notes.append(
             f"并发 {finding.soft_watermark_concurrency} 起进入软水位投影（BUSY），"
-            "但已测范围内未触达硬水位投影（无拒绝、无质量崩塌）："
+            "但已测范围内未触达硬水位投影（无 A1 失败、无质量崩塌）："
             "服务以排队消化压力，治理重点是扩容/调度而非熔断。"
         )
     if (
@@ -599,7 +659,7 @@ def find_watermarks(
     ):
         finding.notes.append(
             f"硬水位投影（并发 {finding.hard_watermark_concurrency}）未晚于软水位投影"
-            f"（并发 {finding.soft_watermark_concurrency}）：压力跳过排队区直接触发拒绝，"
-            "Router 准入策略可能较激进。"
+            f"（并发 {finding.soft_watermark_concurrency}）：压力跳过排队区直接触发硬水位"
+            "（拒绝或客户端超时），Router 准入策略可能较激进，或配置了无限队列。"
         )
     return finding
