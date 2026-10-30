@@ -21,6 +21,10 @@
 
     # 5) 跳过 Phase 0，直接用 absolute 门限压测
     python bench.py --config config.toml --no-baseline
+
+    # 6) 用压测采样训练出的 MLP 做单点预测（无需 numpy，见 docs/06-qos-model.md）
+    python bench.py --qos-model results/qos_model.npz \
+        --qos-predict "concurrency=16,prompt_tokens=4096,completion_tokens=512"
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-from bench import __version__
+from bench import __version__, qos
 from bench.baseline import resolve_thresholds
 from bench.config import Config, ConfigError, load_config
 from bench.metrics import StageStats, classify_watermark, find_capacity
@@ -74,6 +78,22 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--baseline-only",
         action="store_true",
         help="仅执行 Phase 0 基线剖析并打印各桶分位数与生效门限，不做正式压测",
+    )
+    parser.add_argument(
+        "--no-qos",
+        action="store_true",
+        help="关闭服务质量预测模型（仅评估，不训练/不加载 MLP）",
+    )
+    parser.add_argument(
+        "--retrain-qos",
+        action="store_true",
+        help="忽略已存在的模型文件，强制从当前数据库重训预测模型",
+    )
+    parser.add_argument("--qos-model", help="覆盖 qos_model.save_path（模型文件路径）")
+    parser.add_argument(
+        "--qos-predict",
+        metavar="SPEC",
+        help='用已有模型做单点预测后退出，如 "concurrency=16,prompt_tokens=4096,completion_tokens=512"',
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
@@ -124,6 +144,67 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> None:
             cfg.slo.target_mode = "absolute"
             print("[note] --no-baseline 已跳过 Phase 0 基线，target_mode 由 "
                   "baseline_relative 回退为 absolute 门限。")
+
+    # 预测模型开关（压测后训练/加载 MLP，见 docs/06-qos-model.md）
+    if args.qos_model:
+        cfg.qos_model.save_path = args.qos_model
+    if args.no_qos:
+        cfg.qos_model.enabled = False
+    if args.retrain_qos and args.no_qos:
+        raise ConfigError("--retrain-qos 与 --no-qos 互斥")
+
+
+def _qos_predict(cfg: Config, spec: str) -> int:
+    """--qos-predict：加载模型做单点预测（无需 numpy）。"""
+    from bench.qos import QoSModel
+
+    path = cfg.qos_model.save_path
+    if not Path(path).exists():
+        print(f"[error] 模型文件不存在: {path}", file=sys.stderr)
+        print("       先跑一次完整压测（qos_model.enabled=true）生成模型，"
+              "或用 --qos-model 指定路径。", file=sys.stderr)
+        return 2
+    try:
+        fields: Dict[str, float] = {}
+        for part in spec.split(","):
+            if "=" not in part:
+                raise ConfigError(f"预测参数格式错误: {part!r}（应为 key=value）")
+            key, value = part.split("=", 1)
+            fields[key.strip()] = float(value)
+        model = QoSModel.load(path)
+        conc = fields.get("concurrency", 1.0)
+        prompt = fields.get("prompt_tokens", 1024.0)
+        completion = fields.get("completion_tokens", 256.0)
+        if conc <= 0 or prompt <= 0 or completion <= 0:
+            raise ConfigError("concurrency / prompt_tokens / completion_tokens 必须为正数")
+    except (ConfigError, ValueError) as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 2
+
+    pred = model.predict(conc, prompt, completion)
+    rates = model.pass_rates(
+        conc, prompt, completion,
+        cfg.slo.ttft_target_s * 1000.0, cfg.slo.tpot_target_ms,
+    )
+    print("=" * 72)
+    print(f"预测输入  : 并发={conc:g}  prompt={prompt:g} tokens  输出={completion:g} tokens")
+    print(f"TTFT 预测 : p50={pred.ttft_p50_ms:.1f}ms  p90={pred.ttft_p90_ms:.1f}ms  "
+          f"p99={pred.ttft_p99_ms:.1f}ms")
+    print(f"TPOT 预测 : p50={pred.tpot_p50_ms:.1f}ms  p90={pred.tpot_p90_ms:.1f}ms  "
+          f"p99={pred.tpot_p99_ms:.1f}ms")
+    print(f"当前门限  : TTFT<={cfg.slo.ttft_target_s * 1000:.0f}ms  "
+          f"TPOT<={cfg.slo.tpot_target_ms:.0f}ms")
+    print(f"通过率    : TTFT {rates.ttft:.1%} / TPOT {rates.tpot:.1%} / "
+          f"双达标(SLO) {rates.both:.1%}")
+    meta = model.meta
+    print(f"模型信息  : 训练于 {meta.get('trained_at', '?')}，"
+          f"R² TTFT={meta.get('r2_ttft', 0):.3f} / TPOT={meta.get('r2_tpot', 0):.3f}，"
+          f"样本 {meta.get('n_samples', 0)}")
+    if pred.extrapolated:
+        print("⚠ 警告    : 输入超出训练包络（"
+              + "；".join(pred.outside) + "），预测不可信、仅供参考")
+    print("=" * 72)
+    return 0
 
 
 def _default_paths(cfg: Config) -> None:
@@ -249,6 +330,9 @@ async def _amain(args: argparse.Namespace) -> int:
     _apply_cli_overrides(cfg, args)
     _default_paths(cfg)
 
+    if args.qos_predict:
+        return _qos_predict(cfg, args.qos_predict)
+
     if args.probe:
         return await _probe_impl(cfg)
 
@@ -289,9 +373,12 @@ async def _amain(args: argparse.Namespace) -> int:
             finding = find_capacity(stats, cfg.analysis)
             meta = store.meta_items()
             meta.setdefault("db_path", cfg.storage.db_path)
+            qos_result = qos.train_or_load(
+                cfg, store, force_train=args.retrain_qos,
+            )
             path = write_report(
                 cfg, store, stats, finding, meta, cfg.report.output_path,
-                thresholds=thresholds, baseline=baseline,
+                thresholds=thresholds, baseline=baseline, qos=qos_result,
             )
             print(f"[done] 报告已生成: {path}")
             return 0
@@ -323,6 +410,12 @@ async def _amain(args: argparse.Namespace) -> int:
                      if cfg.watermark.soft_ttft_p99_ms > 0 else ""))
         print(f"  压力级    : {cfg.load.concurrency_steps}  每级 {cfg.load.stage_duration_s}s"
               f"（预热 {cfg.load.warmup_s}s）")
+        if cfg.qos_model.enabled:
+            print(f"  预测模型  : 开（hidden={cfg.qos_model.hidden}，"
+                  f"样本门限 {cfg.qos_model.min_samples}，上限 {cfg.qos_model.max_train_seconds:.0f}s）"
+                  f"→ {cfg.qos_model.save_path}")
+        else:
+            print("  预测模型  : 关（--no-qos / qos_model.enabled=false）")
         if cfg.derived_lengths:
             print(f"  长度分布  : {'、'.join(cfg.derived_lengths)} 未显式配置，"
                   f"按 max_context_tokens={cfg.requests.max_context_tokens} 自动推导"
@@ -335,15 +428,25 @@ async def _amain(args: argparse.Namespace) -> int:
         thresholds = runner.thresholds
         baseline = runner.baseline
         finding = find_capacity(stats, cfg.analysis)
+        # 实时压测路径强制重训：刚测出的数据就该训练新模型（想跳过用 --no-qos）；
+        # --report-only 路径才优先加载已有模型文件（避免重复训练成本）。
+        qos_result = qos.train_or_load(cfg, store, force_train=True)
 
         meta = store.meta_items()
         path = write_report(
             cfg, store, stats, finding, meta, cfg.report.output_path,
-            thresholds=thresholds, baseline=baseline,
+            thresholds=thresholds, baseline=baseline, qos=qos_result,
         )
         print("=" * 72)
         print(f"[done] 数据库: {cfg.storage.db_path}")
         print(f"[done] 报告  : {path}")
+        if qos_result is not None and qos_result.model is not None and qos_result.report.usable:
+            print(f"[done] 模型  : {qos_result.model_path}"
+                  f"（R² TTFT={qos_result.report.r2_ttft:.3f} / "
+                  f"TPOT={qos_result.report.r2_tpot:.3f}，"
+                  f"预测见报告第九节）")
+        elif qos_result is not None and qos_result.report.skip_reason:
+            print(f"[done] 模型  : 未生成（{qos_result.report.skip_reason}）")
         if finding.quality_capacity is not None:
             print(
                 f"[done] 结论  : 质量有效容量（SLA>={cfg.analysis.sla_target:.1%} 且 "

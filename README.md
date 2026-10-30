@@ -57,6 +57,9 @@ benchmark/
 │   ├── stats.py              #   分位数（最近秩）与均值
 │   ├── baseline.py           #   长度分桶、Phase 0 基线剖析、门限解析
 │   ├── metrics.py            #   A1/A2/A3 分类、分位数、容量与水位判定
+│   ├── qos.py                #   预测模型：数据集、分组 CV 训练、ECDF 校准、仿真
+│   ├── mlp.py                #   纯 Python 多层感知机（Adam）
+│   ├── npz.py                #   纯标准库 .npz/.npy 读写（numpy 互操作）
 │   ├── store.py              #   SQLite 存储（只存特征，不存原文）
 │   ├── runner.py             #   Phase 0 + 递增并发编排（闭环/开环）
 │   └── report.py             #   Markdown 评估报告生成
@@ -66,7 +69,8 @@ benchmark/
 │   ├── 02-pd-capacity-model.md # 容量模型：PD 分离、两阶段过载、递增并发
 │   ├── 03-threshold-calibration.md # 门限定标：基线定标、长度分桶、退化率
 │   ├── 04-measurement-validity.md # 测量有效性：偏差识别与控制
-│   └── 05-watermark.md       #   水位语义：服务端水位的黑盒投影（软/硬/SLA）
+│   ├── 05-watermark.md       #   水位语义：服务端水位的黑盒投影（软/硬/SLA）
+│   └── 06-qos-model.md       #   预测模型：压测采样训练 MLP 预测 TTFT/TPOT
 └── results/                  # 输出目录（db + report）
 ```
 
@@ -121,6 +125,17 @@ python bench.py --config config.toml --baseline-only
 ```bash
 python bench.py --config config.toml --no-baseline
 ```
+
+用训练好的模型做单点预测（无需 numpy；模型来自 `qos_model.save_path`
+或 `--qos-model`）：
+
+```bash
+python bench.py --qos-model results/qos_model.npz \
+    --qos-predict "concurrency=16,prompt_tokens=4096,completion_tokens=512"
+# 输出：TTFT/TPOT 的 p50/p90/p99 预测（毫秒）+ 是否超出训练包络
+```
+
+关闭预测模型（仅评估、不训练）：`--no-qos`。
 
 ## 4. 测试方法
 
@@ -227,6 +242,29 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 > （需积累足够 A3 样本才能分辨）。真正的资源水位计算在服务端
 > （Prometheus 指标 + 监控分析器），两者互补而非替代。
 
+### 5.6 服务质量预测模型（MLP）
+
+评估的产物是**离散压力级上的阶跃观测**：只知 8 并发达标、16 并发崩塌，
+中间与之外都是空白。`[qos_model]` 把压测采样（不同并发 × 不同请求长度）
+同时用作训练数据，训练一个多层感知机，输入**请求数据特征 + 负载情况**
+（并发、prompt 长度、输出长度），预测 TTFT/TPOT（方法论详见
+[docs/06-qos-model.md](docs/06-qos-model.md)）：
+
+- **入训样本**：非预热的 measured 请求，A3 必须保留（膝点区只有 A3 样本）；
+  warmup / aborted / A1 失败样本剔除
+- **训练协议**：目标 log 变换；**按 stage 分组 K 折**交叉验证（防同级样本
+  泄漏）；折外残差汇成 ECDF，直接给出分位数与通过率
+  `P(时延≤T) = F_resid(log T − ŷ)`，不假设分布族
+- **包络守卫**：超出训练覆盖的（并发 × 长度）范围的预测标记"外推"，
+  不参与任何结论；容量/水位边界在包络内细扫插值
+- **模型文件**：`results/qos_model.npz`（ZIP + .npy，纯标准库读写），
+  可被 numpy 生态直接 `np.load()`；`--qos-predict` 无需 numpy 即可单点预测
+
+预测章节给出：预测 vs 实测对照（已测并发上偏差应在残差分位数内）、
+参考流量下的 TTFT/TPOT 预测曲线、水位边界细扫（与实测边界互相印证）。
+模型绑定当次服务配置，换引擎/模型必须重训；近膝点预测方差最大
+（平滑网络涂抹膝点），容量结论仍以实测连续前缀规则为准。
+
 ## 6. 关键配置
 
 | 参数 | 说明 | 建议 |
@@ -253,6 +291,13 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 | `watermark.hard_slo_violation_ratio` | 硬水位（OVERLOAD）门限：A3 占比 | 默认 50%（过半不达标 = 质量崩塌） |
 | `watermark.hard_reject_ratio` | 硬水位（OVERLOAD）门限：A1 占比 | 默认 1%；服务端限流不会零星出现 |
 | `watermark.soft_ttft_p99_ms` | 软水位附加门限：TTFT p99 绝对值 | 默认 0（关闭）；开启后在 A3 尚少时提前报 BUSY，跨引擎对比时记得调整 |
+| `qos_model.enabled` | 是否训练 MLP 预测模型 | 开启后压测结束自动训练并写 `.npz`；样本不足时跳过并在报告说明 |
+| `qos_model.min_samples` | 最低训练样本量 | 默认 200；低于此值模型不可信，宁可不训 |
+| `qos_model.hidden` | 隐藏层宽度 | 默认 `[12, 12]`；小数据下更大网络只会过拟合 |
+| `qos_model.epochs` | 最大训练轮数（全批量 Adam） | 默认 120；受 `max_train_seconds` 硬预算截断 |
+| `qos_model.max_train_seconds` | 训练时长硬上限 | 默认 150s；4000 样本全量验证约 95s，纯 Python 实现的兜底保护 |
+| `qos_model.min_r2` | 验证 R² 下限 | 默认 0.5；低于此值报告只渲染数据口径、不出预测结论 |
+| `qos_model.save_path` | 模型文件路径 | 默认 `results/qos_model.npz`；`--report-only` 时存在则直接加载 |
 
 完整字段见 `config.example.toml` 内注释。
 
@@ -278,7 +323,12 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 + 水位边界 + 容量判定的补充说明）→ 基线剖析与生效门限（含按桶门限表"来源"列与质量退化率表）
 → 方法 → 分级结果（含 SLO 判定列与水位状态列）→ 延迟分布（含 connect 开销提示）
 → A1 构成 → A3 归因（TTFT/TPOT/双超标 + 按长度桶拆分）
-→ 特征覆盖（含计划 vs 实测长度偏差告警）→ 建议 → 附录。
+→ 特征覆盖（含计划 vs 实测长度偏差告警）→ 服务质量预测模型（预测 vs 实测对照、
+预测曲线、水位边界细扫、包络警告）→ 建议 → 附录。
+
+**预测模型（`results/qos_model.npz`）**：ZIP + `.npy` 容器（权重、归一化参数、
+残差 ECDF、包络、元数据），可被 numpy 生态 `np.load()` 直接消费；
+纯标准库实现，`--qos-predict` 无 numpy 环境亦可推理。
 
 ## 8. 工具自测（无需真实服务）
 

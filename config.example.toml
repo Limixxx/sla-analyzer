@@ -140,6 +140,35 @@ hard_reject_ratio = 0.01
 # 0 = 关闭（只用违约率判据，不引入第二套绝对尺子）；跨引擎对比时记得调整
 soft_ttft_p99_ms = 0.0
 
+[qos_model]
+# 服务质量预测模型：压测采样（不同并发 × 不同请求长度）同时用作训练数据，
+# 训练一个多层感知机（MLP），输入并发/prompt 长度/输出长度，预测 TTFT/TPOT。
+# 方法论与统计纪律（按 stage 分组交叉验证、残差 ECDF 校准、包络守卫）
+# 详见 docs/06-qos-model.md。纯 Python 标准库实现，无第三方依赖。
+enabled = true
+# 入训样本：非预热的 measured 请求；A3（超门限）必须保留——容量膝点区只有 A3 样本。
+# warmup / aborted / A1 失败样本剔除（A1 通常伴随超时截断，时延畸变）
+# 最低训练样本量：低于此值模型不可信，宁可不训（报告会说明跳过原因）
+min_samples = 200
+# 隐藏层宽度。小数据下更大网络只会过拟合；拟合不足时可先加样本再加宽
+hidden = [12, 12]
+# 训练参数：全批量 Adam，MSE 损失（log 空间）。epochs 受 max_train_seconds 截断
+epochs = 120
+learning_rate = 0.01
+# 交叉验证折数：按 stage 分组（同级样本共享并发特征，随机划分会泄漏导致指标虚高）；
+# stage 数不足时自动降级并标注"无有效验证"
+val_folds = 4
+# 验证 R² 下限：任一目标低于此值，报告只渲染数据口径、不给预测结论
+min_r2 = 0.5
+# 单级样本封顶（按 stage 分层抽样）：控制纯 Python 训练时长
+max_samples = 4000
+# 训练时长硬预算（秒）：超时即用已训轮次，保证压测总时长可控。
+# 参考基准（本机）：4000 样本 + [12,12] 全量交叉验证 + 终训 ≈ 95s
+max_train_seconds = 150
+# 模型文件：.npz（ZIP + .npy 容器），可被 numpy 生态 np.load() 直接消费。
+# --report-only 时若文件存在则直接加载重算，不存在则按当前配置重训
+save_path = "results/qos_model.npz"
+
 [storage]
 # 留空则自动生成 results/bench_<时间戳>.db
 db_path = ""

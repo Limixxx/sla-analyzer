@@ -127,6 +127,28 @@ class WatermarkConfig:
 
 
 @dataclass
+class QosModelConfig:
+    """服务质量预测模型（MLP）参数，见 docs/06-qos-model.md。
+
+    压测采样（并发 × prompt × completion → TTFT/TPOT）训练一个小型 MLP，
+    把离散压力级间的空白补成连续预测。三条统计纪律不可协商：
+    按 stage 分组交叉验证（防同级泄漏）、残差 ECDF 校准（不假设分布族）、
+    包络守卫（外推不参与结论）。
+    """
+
+    enabled: bool = True
+    min_samples: int = 200            # 低于此样本量不训练（宁缺勿滥）
+    hidden: List[int] = field(default_factory=lambda: [12, 12])
+    epochs: int = 120                 # 最大轮数（全批量 Adam）
+    learning_rate: float = 0.01
+    val_folds: int = 4                # 按 stage 分组的折数；stage 不足自动降级
+    min_r2: float = 0.5               # 验证 R² 下限，低于此值报告不出预测结论
+    max_samples: int = 4000           # 单级样本封顶（按 stage 分层抽样）
+    max_train_seconds: float = 150.0  # 训练时长硬预算（纯 Python，见 docs/06 §2 基准）
+    save_path: str = "results/qos_model.npz"
+
+
+@dataclass
 class AnalysisConfig:
     """结论判定参数。"""
 
@@ -166,6 +188,7 @@ class Config:
     storage: StorageConfig
     report: ReportConfig
     watermark: WatermarkConfig = field(default_factory=WatermarkConfig)
+    qos_model: QosModelConfig = field(default_factory=QosModelConfig)
     source_path: str = ""
     # 本次运行中由 max_context_tokens 自动推导的字段名（如 ["prompt_token_targets"]）；
     # 空列表表示长度参数全部为显式配置。仅用于日志/报告标注，可审计。
@@ -209,6 +232,10 @@ class Config:
             "watermark_hard_slo_violation_ratio": self.watermark.hard_slo_violation_ratio,
             "watermark_hard_reject_ratio": self.watermark.hard_reject_ratio,
             "watermark_soft_ttft_p99_ms": self.watermark.soft_ttft_p99_ms,
+            "qos_model_enabled": self.qos_model.enabled,
+            "qos_model_min_samples": self.qos_model.min_samples,
+            "qos_model_hidden": list(self.qos_model.hidden),
+            "qos_model_save_path": self.qos_model.save_path,
             "prompt_token_targets": list(self.requests.prompt_token_targets),
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
@@ -341,6 +368,7 @@ def load_config(path: str) -> Config:
     sto_raw = raw.get("storage", {})
     rep_raw = raw.get("report", {})
     wm_raw = raw.get("watermark", {})
+    qm_raw = raw.get("qos_model", {})
 
     service = ServiceConfig(
         base_url=_optional(svc_raw, "base_url", ServiceConfig.base_url, str, "service"),
@@ -433,6 +461,22 @@ def load_config(path: str) -> Config:
         ),
     )
 
+    qos_model = QosModelConfig(
+        enabled=_optional(qm_raw, "enabled", QosModelConfig.enabled, bool, "qos_model"),
+        min_samples=_optional(qm_raw, "min_samples", QosModelConfig.min_samples, int, "qos_model"),
+        hidden=_int_list(qm_raw, "hidden", "qos_model")
+        or _field_default(QosModelConfig, "hidden"),
+        epochs=_optional(qm_raw, "epochs", QosModelConfig.epochs, int, "qos_model"),
+        learning_rate=_optional(qm_raw, "learning_rate", QosModelConfig.learning_rate, float, "qos_model"),
+        val_folds=_optional(qm_raw, "val_folds", QosModelConfig.val_folds, int, "qos_model"),
+        min_r2=_optional(qm_raw, "min_r2", QosModelConfig.min_r2, float, "qos_model"),
+        max_samples=_optional(qm_raw, "max_samples", QosModelConfig.max_samples, int, "qos_model"),
+        max_train_seconds=_optional(
+            qm_raw, "max_train_seconds", QosModelConfig.max_train_seconds, float, "qos_model"
+        ),
+        save_path=_optional(qm_raw, "save_path", QosModelConfig.save_path, str, "qos_model"),
+    )
+
     cfg = Config(
         service=service,
         slo=slo,
@@ -442,6 +486,7 @@ def load_config(path: str) -> Config:
         storage=storage,
         report=report,
         watermark=watermark,
+        qos_model=qos_model,
         source_path=str(p),
     )
     _resolve_length_defaults(cfg)
@@ -533,6 +578,29 @@ def validate(cfg: Config) -> None:
         )
     if w.soft_ttft_p99_ms < 0:
         raise ConfigError("watermark.soft_ttft_p99_ms 不能为负（0 表示关闭该判据）")
+
+    # --- 预测模型参数 ---
+    q = cfg.qos_model
+    if q.min_samples <= 0:
+        raise ConfigError("qos_model.min_samples 必须为正数")
+    if not q.hidden or any(h <= 0 for h in q.hidden):
+        raise ConfigError("qos_model.hidden 必须为非空正整数数组（隐藏层宽度）")
+    if len(q.hidden) > 4:
+        raise ConfigError("qos_model.hidden 超过 4 个隐藏层时纯 Python 训练代价过高")
+    if q.epochs <= 0:
+        raise ConfigError("qos_model.epochs 必须为正数")
+    if q.learning_rate <= 0:
+        raise ConfigError("qos_model.learning_rate 必须为正数")
+    if q.val_folds <= 0:
+        raise ConfigError("qos_model.val_folds 必须为正数")
+    if not 0.0 <= q.min_r2 <= 1.0:
+        raise ConfigError("qos_model.min_r2 必须在 [0, 1] 区间")
+    if q.max_samples < q.min_samples:
+        raise ConfigError("qos_model.max_samples 不能小于 min_samples")
+    if q.max_train_seconds <= 0:
+        raise ConfigError("qos_model.max_train_seconds 必须为正数")
+    if q.enabled and not str(q.save_path).strip():
+        raise ConfigError("qos_model.enabled=true 时 qos_model.save_path 不能为空")
 
     # --- SLO 门限来源 ---
     if cfg.slo.target_mode not in ("absolute", "baseline_relative"):

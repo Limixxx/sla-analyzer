@@ -8,9 +8,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import metrics
-from .baseline import BaselineResult, Thresholds, bucket_label
+from . import qos as qos_mod
+from .baseline import BaselineResult, Thresholds, bucket_label, bucket_of
 from .config import Config
 from .metrics import CapacityFinding, StageStats, WatermarkFinding
+from .qos import (
+    BoundaryScan,
+    MixPoint,
+    QoSResult,
+    StagePrediction,
+    apply_limits,
+    build_dataset,
+    mix_of,
+    scan_boundaries,
+    simulate_stage,
+)
 from .store import RecordStore
 
 
@@ -173,14 +185,310 @@ def _render_baseline_section(
 
 
 # ---------------------------------------------------------------------- #
+# 服务质量预测模型（MLP）
+# ---------------------------------------------------------------------- #
+def _qos_bucket_limits(stages: Sequence[StageStats]) -> Dict[int, Tuple[float, float]]:
+    """从任一级的按桶统计量取各长度桶的生效门限（TTFT/TPOT，毫秒）。"""
+    for s in stages:
+        if not s.bucket_stats:
+            continue
+        limits: Dict[int, Tuple[float, float]] = {}
+        for b, entry in s.bucket_stats.items():
+            ttft = entry.get("ttft_limit_ms")
+            tpot = entry.get("tpot_limit_ms")
+            if ttft and tpot:
+                limits[int(b)] = (float(ttft), float(tpot))
+        if limits:
+            return limits
+    return {}
+
+
+def _qos_default_limits(
+    cfg: Config, limits: Dict[int, Tuple[float, float]]
+) -> Tuple[float, float]:
+    if limits:
+        return limits[min(limits)]
+    return cfg.slo.ttft_target_s * 1000.0, cfg.slo.tpot_target_ms
+
+
+def _prepare_qos(
+    cfg: Config,
+    store: RecordStore,
+    stages: Sequence[StageStats],
+    qos: Optional[QoSResult],
+) -> None:
+    """预计算预测章节所需的 mix / 分级预测 / 边界细扫（结论区也要引用 scan）。"""
+    if qos is None or qos.model is None or not qos.report.usable:
+        return
+    samples = build_dataset(store, cfg.qos_model)
+    if not samples:
+        return
+    buckets = cfg.requests.length_buckets
+    limits = _qos_bucket_limits(stages)
+    default_ttft, default_tpot = _qos_default_limits(cfg, limits)
+
+    ref_mix = mix_of(samples, buckets, bucket_of)
+    apply_limits(ref_mix, limits)
+    qos.reference_mix = ref_mix
+
+    by_stage: Dict[int, List] = {}
+    for s in samples:
+        by_stage.setdefault(s.stage_id, []).append(s)
+
+    qos.stage_predictions = {}
+    for st in stages:
+        mix = mix_of(by_stage.get(st.stage_id, []), buckets, bucket_of)
+        apply_limits(mix, limits)
+        if not mix:
+            continue
+        qos.stage_mix[st.stage_id] = mix
+        qos.stage_predictions[st.stage_id] = simulate_stage(
+            qos.model, st.concurrency, mix, default_ttft, default_tpot
+        )
+
+    ordered = sorted(stages, key=lambda x: x.concurrency)
+    if ordered:
+        qos.scan = scan_boundaries(
+            qos.model, ref_mix, default_ttft, default_tpot,
+            cfg.analysis.slo_target, cfg.watermark,
+            ordered[0].concurrency, ordered[-1].concurrency,
+        )
+
+
+def _render_qos_section(
+    cfg: Config,
+    store: RecordStore,
+    stages: Sequence[StageStats],
+    qos: Optional[QoSResult],
+) -> List[str]:
+    """第九节：预测模型卡片、预测 vs 实测对照、预测曲线与水位边界细扫。"""
+    lines: List[str] = []
+    lines.append("## 九、服务质量预测模型（MLP）")
+    lines.append("")
+
+    if qos is None or qos.model is None:
+        reason = qos.report.skip_reason if qos is not None else "未启用"
+        lines.append(f"本次未生成预测模型：{reason or '未知原因'}。")
+        lines.append("")
+        lines.append("> 训练需要足够多的 measured 成功样本（`qos_model.min_samples`，默认 200）"
+                     "与至少 2 个压力级；增大 `load.stage_duration_s` 或补充压力级后重测即可。")
+        lines.append("")
+        return lines
+
+    if qos.load_warning:
+        lines.append(f"> **警告**：{qos.load_warning}。")
+        lines.append("")
+
+    rep = qos.report
+    lines.append("> 方法论见 [docs/06-qos-model.md](docs/06-qos-model.md)：输入（并发, prompt 长度, "
+                 "输出长度）→ 预测 TTFT/TPOT 分位数与 SLA/SLO 通过率。"
+                 "模型绑定当次服务配置，换引擎/模型/并行度必须重训。")
+    lines.append("")
+
+    # ---- 9.1 训练与验证 ----
+    lines.append("### 9.1 训练与验证")
+    lines.append("")
+    src_txt = {"trained": "本次训练", "loaded": "加载已有模型"}.get(qos.source, qos.source)
+    lines.append(f"- 模型来源：{src_txt}"
+                 + (f"（`{qos.model_path}`）" if qos.model_path else ""))
+    lines.append(f"- 训练样本：{rep.n_samples} 个 measured 成功请求 / {rep.n_stages} 个压力级"
+                 "（A3 保留——膝点区只有 A3；warmup / aborted / A1 剔除）")
+    lines.append(f"- 网络结构：{len(cfg.qos_model.hidden) + 2} 层（输入 3 → "
+                 f"隐藏 {'→'.join(str(h) for h in cfg.qos_model.hidden)} → 输出 2），"
+                 f"log 目标 + 标准化，全批量 Adam")
+    lines.append(f"- 训练时长：{rep.seconds:.1f}s"
+                 + ("（模型文件记录，非本次训练）" if qos.source == "loaded" else "")
+                 + (f"（被 max_train_seconds={cfg.qos_model.max_train_seconds:.0f}s 截断）"
+                    if rep.stopped_by_deadline else ""))
+    lines.append("")
+    if rep.cross_validated:
+        lines.append("| 目标 | 验证 R²（折外） | MAE | MAPE |")
+        lines.append("| --- | --- | --- | --- |")
+        lines.append(f"| TTFT | {rep.r2_ttft:.3f} | {rep.mae_ttft_ms:.1f} ms | {rep.mape_ttft:.1%} |")
+        lines.append(f"| TPOT | {rep.r2_tpot:.3f} | {rep.mae_tpot_ms:.1f} ms | {rep.mape_tpot:.1%} |")
+        lines.append("")
+        lines.append(f"- 交叉验证：按 stage 分组 {len(rep.folds)} 折"
+                     f"（防同级样本泄漏）；终训轮数 {rep.best_epochs_median}"
+                     f"（各折最优轮数中位数）")
+        if rep.folds:
+            fold_txt = "；".join(
+                f"折{f.fold + 1}@{','.join(str(c) for c in f.val_stage_ids)}({f.best_epoch}ep)"
+                for f in rep.folds
+            )
+            lines.append(f"- 折明细（验证级@stage id）：{fold_txt}")
+    else:
+        lines.append("> **无有效交叉验证**（压力级少于 2 个）：上述指标为训练集指标，"
+                     "偏乐观，不能作为预测可信度依据。")
+    for w in rep.warnings:
+        lines.append(f"- 注意：{w}")
+    lines.append("")
+
+    if not rep.usable:
+        lines.append(f"**模型不具备预测价值**（{rep.skip_reason}）。"
+                     "本节以下仅渲染数据口径，不给预测结论。")
+        lines.append("")
+        return lines
+
+    # ---- 数据与 mix ----
+    if not qos.reference_mix:
+        lines.append("> 数据库中没有可用样本，无法生成预测对照。")
+        lines.append("")
+        return lines
+    buckets = cfg.requests.length_buckets
+    limits = _qos_bucket_limits(stages)
+    default_ttft, default_tpot = _qos_default_limits(cfg, limits)
+    ref_mix = qos.reference_mix
+
+    # ---- 9.2 预测 vs 实测 ----
+    lines.append("### 9.2 预测 vs 实测（已测并发）")
+    lines.append("")
+    rows = []
+    for st in sorted(stages, key=lambda x: x.concurrency):
+        if st.n_total == 0:
+            continue
+        sp = qos.stage_predictions.get(st.stage_id)
+        if sp is None:
+            continue
+        dev = abs(sp.pred_slo - st.slo) / max(st.slo, 1e-9)
+        flag = " ⚠" if dev > 0.25 else ""
+        rows.append([
+            str(st.concurrency),
+            str(st.n_total),
+            _ms(st.ttft_p50_ms), f"{sp.pred_ttft_p50_ms:.0f}",
+            _ms(st.ttft_p99_ms), f"{sp.pred_ttft_p99_ms:.0f}",
+            _ms(st.tpot_p50_ms), f"{sp.pred_tpot_p50_ms:.1f}",
+            _ms(st.tpot_p99_ms), f"{sp.pred_tpot_p99_ms:.1f}",
+            _pct(st.slo, 2), _pct(sp.pred_slo, 2) + flag,
+        ])
+    if rows:
+        lines.append(_table(
+            ["并发", "样本", "TTFT p50 实测", "TTFT p50 预测", "TTFT p99 实测", "TTFT p99 预测",
+             "TPOT p50 实测", "TPOT p50 预测", "TPOT p99 实测", "TPOT p99 预测",
+             "SLO 实测", "SLO 预测"],
+            rows,
+        ))
+        lines.append("")
+        lines.append("> 预测为该并发实际流量构成下的桶加权值；分位数由折外残差 ECDF 校准。")
+        lines.append("> **口径说明**：实测 SLO 的分母含 A1（被拒绝的请求拉低实测值），"
+                     "而预测只回答\"成功请求的质量\"——两者在高并发拒绝区必然分叉，"
+                     "这是语义差异而非模型误差；⚠ 标记仅提示偏离幅度，"
+                     "低并发区的偏离才真正反映模型精度。")
+    else:
+        lines.append("> 没有带样本的压力级，跳过对照。")
+    lines.append("")
+
+    # ---- 9.3 参考流量下的预测曲线 ----
+    ordered = sorted(stages, key=lambda x: x.concurrency)
+    if not ordered:
+        return lines
+    scan = qos.scan
+    if scan is None:
+        # _prepare_qos 未覆盖（如直接调用渲染）时兜底重算
+        scan = scan_boundaries(
+            qos.model, ref_mix, default_ttft, default_tpot,
+            cfg.analysis.slo_target, cfg.watermark,
+            ordered[0].concurrency, ordered[-1].concurrency,
+        )
+        qos.scan = scan
+
+    lines.append("### 9.3 参考流量下的预测曲线")
+    lines.append("")
+    mix_txt = "；".join(
+        f"{bucket_label(m.bucket, buckets)}({m.prompt_tokens:.0f}/{m.completion_tokens:.0f}) "
+        f"{m.weight:.0%}"
+        for m in ref_mix
+    )
+    lines.append(f"- 参考流量构成（本次实测聚合并按桶均值代表）：{mix_txt}")
+    lines.append(f"- 扫描范围：并发 {scan.conc_min} ~ {scan.conc_max}（训练包络内，步进 1）")
+    lines.append("")
+    rows = []
+    for c in scan.grid:
+        sp = simulate_stage(qos.model, c, ref_mix, default_ttft, default_tpot)
+        note = "（外推）" if sp.extrapolated else ""
+        rows.append([
+            str(c) + note,
+            f"{sp.pred_ttft_p50_ms:.0f}", f"{sp.pred_ttft_p99_ms:.0f}",
+            f"{sp.pred_tpot_p50_ms:.1f}", f"{sp.pred_tpot_p99_ms:.1f}",
+            _pct(sp.pred_slo, 2),
+            f"{1 - sp.pred_slo:.1%}",
+        ])
+    lines.append(_table(
+        ["并发", "TTFT p50 (ms)", "TTFT p99 (ms)", "TPOT p50 (ms)", "TPOT p99 (ms)",
+         "预测 SLO 通过率", "预测 A3 占比"],
+        rows,
+    ))
+    lines.append("")
+
+    # ---- 水位边界细扫 ----
+    lines.append("**水位边界细扫**（与第四节的实测边界互相印证）：")
+    lines.append("")
+    soft_txt = f"并发 {scan.soft_boundary}" if scan.soft_boundary is not None else "未触达"
+    hard_txt = f"并发 {scan.hard_boundary}" if scan.hard_boundary is not None else "未触达"
+    cap_txt = (
+        f"并发 {scan.quality_capacity}"
+        if scan.quality_capacity is not None else "包络内未达到"
+    )
+    measured_soft = next(
+        (s.concurrency for s in ordered if s.watermark_state in ("BUSY", "OVERLOAD")), None
+    )
+    measured_hard = next(
+        (s.concurrency for s in ordered if s.watermark_state == "OVERLOAD"), None
+    )
+    measured_collapse = next(
+        (
+            s.concurrency
+            for s in ordered
+            if s.n_total > 0 and s.a3 / s.n_total >= cfg.watermark.hard_slo_violation_ratio
+        ),
+        None,
+    )
+    lines.append(f"- 预测软水位（A3 占比 ≥ {cfg.watermark.soft_slo_violation_ratio:.0%}）："
+                 f"{soft_txt}（实测 {measured_soft if measured_soft else '未触达'}）")
+    collapse_txt = (
+        f"并发 {measured_collapse}" if measured_collapse is not None else "未触达"
+    )
+    hard_measured_txt = (
+        f"；A1 拒绝型硬水位实测 {measured_hard}"
+        if measured_hard is not None else ""
+    )
+    lines.append(f"- 预测硬水位-质量崩塌（A3 占比 ≥ {cfg.watermark.hard_slo_violation_ratio:.0%}）："
+                 f"{hard_txt}（实测质量崩塌 {collapse_txt}{hard_measured_txt}）")
+    lines.append(f"- 预测质量容量（SLO ≥ {cfg.analysis.slo_target:.0%} 连续前缀，"
+                 f"**仅质量口径**）：{cap_txt}"
+                 "（实测容量还要求 SLA 达标，含拒绝影响，两者在拒绝区分叉属预期）")
+    lines.append("- A1 驱动的硬水位（拒绝率）**不在模型能力内**：模型只预测成功请求的质量，"
+                 "不预测失败/拒绝概率，该边界以实测为准。")
+    lines.append("")
+
+    # ---- 9.4 模型文件 ----
+    lines.append("### 9.4 模型文件与使用")
+    lines.append("")
+    lines.append(f"- 文件：`{qos.model_path}`（.npz：ZIP + .npy，"
+                 "可被 numpy 生态 `np.load()` 直接消费）")
+    lines.append("- 单点预测（无需 numpy）：")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"python bench.py --qos-model {qos.model_path} \\")
+    lines.append('    --qos-predict "concurrency=16,prompt_tokens=4096,completion_tokens=512"')
+    lines.append("```")
+    lines.append("")
+    lines.append("- 包络："
+                 f"并发 {qos.model.feat_min[0]:.0f}~{qos.model.feat_max[0]:.0f}，"
+                 f"prompt {qos.model.feat_min[1]:.0f}~{qos.model.feat_max[1]:.0f}，"
+                 f"输出 {qos.model.feat_min[2]:.0f}~{qos.model.feat_max[2]:.0f}；"
+                 "超出包络的预测一律标记外推且不参与结论。")
+    lines.append("")
+    return lines
+
+# ---------------------------------------------------------------------- #
 # 结论
 # ---------------------------------------------------------------------- #
-
 def build_conclusions(
     cfg: Config,
     stages: Sequence[StageStats],
     finding: CapacityFinding,
     watermark: Optional[WatermarkFinding] = None,
+    qos: Optional[QoSResult] = None,
 ) -> List[str]:
     """结论：以质量容量（SLA∧SLO 同时达标）为生产并发建议的唯一基准。
 
@@ -323,6 +631,18 @@ def build_conclusions(
         lines.append("水位判定的补充说明：")
         for note in watermark.notes:
             lines.append(note)
+    if qos is not None and qos.usable:
+        scan = qos.scan
+        pred_txt = (
+            f"预测质量容量边界 = 并发 {scan.quality_capacity}（实测 {finding.quality_capacity}）"
+            if scan is not None and scan.quality_capacity is not None
+            else "预测边界见第九节"
+        )
+        lines.append(
+            f"服务质量预测模型已训练（验证 R²：TTFT={qos.report.r2_ttft:.3f} / "
+            f"TPOT={qos.report.r2_tpot:.3f}，见第九节）：{pred_txt}；"
+            "预测仅对训练包络内的负载点有效，容量结论仍以实测连续前缀规则为准。"
+        )
     return lines
 
 
@@ -330,6 +650,7 @@ def build_recommendations(
     cfg: Config,
     stages: Sequence[StageStats],
     finding: CapacityFinding,
+    qos: Optional[QoSResult] = None,
 ) -> List[str]:
     recs: List[str] = []
     if not stages:
@@ -420,6 +741,19 @@ def build_recommendations(
             "若需自动适配不同引擎/模型规模，可改用 slo.target_mode=baseline_relative。"
         )
 
+    # 预测模型使用建议
+    if qos is not None and qos.usable:
+        recs.append(
+            "预测模型使用建议：容量规划可用模型在包络内做 what-if（换流量构成/并发梯度，"
+            "无需重跑压测）；模型对训练包络外的负载点只作参考、不构成结论；"
+            "更换引擎/模型/并行度后必须重训（模型绑定当次服务配置）。"
+        )
+        if qos.scan is not None and qos.scan.quality_capacity is not None:
+            recs.append(
+                f"预测细扫提示：模型在并发 {qos.scan.quality_capacity} 处预测 SLO 跌破目标，"
+                "若该点与实测边界不一致，应在该并发附近补测以校准。"
+            )
+
     # 水位运维建议：把水位边界翻译成 Router / 调度层可消费的配置
     if cfg.watermark.enabled:
         states = {s.concurrency: s.watermark_state for s in stages if s.watermark_state != "unknown"}
@@ -469,12 +803,15 @@ def render_report(
     meta: Dict[str, str],
     thresholds: Optional[Thresholds] = None,
     baseline: Optional[BaselineResult] = None,
+    qos: Optional[QoSResult] = None,
 ) -> str:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     started = meta.get("started_at", "unknown")
     lines: List[str] = []
     buckets = cfg.requests.length_buckets
     wm_finding = metrics.find_watermarks(stages, cfg.watermark, finding)
+    # 预测模型预计算（mix / 分级预测 / 边界细扫）必须先于结论：结论区引用 qos.scan
+    _prepare_qos(cfg, store, stages, qos)
 
     lines.append("# PD 分离推理服务质量（SLO/SLA）评估报告")
     lines.append("")
@@ -491,7 +828,7 @@ def render_report(
     # 结论 -----------------------------------------------------------------
     lines.append("## 一、结论")
     lines.append("")
-    for item in build_conclusions(cfg, stages, finding, wm_finding):
+    for item in build_conclusions(cfg, stages, finding, wm_finding, qos):
         lines.append(f"- {item}")
     lines.append("")
 
@@ -750,10 +1087,13 @@ def render_report(
                      f"（计划 {planned_c:.0f}）")
     lines.append("")
 
+    # 预测模型 -------------------------------------------------------------
+    lines.extend(_render_qos_section(cfg, store, stages, qos))
+
     # 建议 -----------------------------------------------------------------
-    lines.append("## 九、建议")
+    lines.append("## 十、建议")
     lines.append("")
-    for item in build_recommendations(cfg, stages, finding):
+    for item in build_recommendations(cfg, stages, finding, qos):
         lines.append(f"- {item}")
     lines.append("")
 
@@ -788,8 +1128,9 @@ def render_report(
 def write_report(cfg: Config, store: RecordStore, stages: Sequence[StageStats],
                  finding: CapacityFinding, meta: Dict[str, str], output_path: str,
                  thresholds: Optional[Thresholds] = None,
-                 baseline: Optional[BaselineResult] = None) -> str:
-    text = render_report(cfg, store, stages, finding, meta, thresholds, baseline)
+                 baseline: Optional[BaselineResult] = None,
+                 qos: Optional[QoSResult] = None) -> str:
+    text = render_report(cfg, store, stages, finding, meta, thresholds, baseline, qos)
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
