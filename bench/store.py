@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS stages (
     ended_at        REAL,
     duration_s      REAL,
     warmup_s        REAL,
+    actual_duration_s REAL,
     n_warmup        INTEGER DEFAULT 0,
     n_total         INTEGER DEFAULT 0,
     n_ok            INTEGER DEFAULT 0,
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS stages (
     tpot_p99_ms     REAL,
     e2e_p50_ms      REAL,
     e2e_p99_ms      REAL,
+    connect_p50_ms  REAL,
+    connect_p99_ms  REAL,
     rps             REAL,
     output_tps      REAL,
     prompt_tokens_avg   REAL,
@@ -65,6 +68,7 @@ CREATE TABLE IF NOT EXISTS baseline (
     stage_id      INTEGER NOT NULL,
     concurrency   INTEGER,
     duration_s    REAL,
+    duration_actual_s REAL,
     bucket        INTEGER NOT NULL,
     n             INTEGER DEFAULT 0,
     n_ok          INTEGER DEFAULT 0,
@@ -137,10 +141,10 @@ INSERT INTO stage_buckets (
 
 _INSERT_BASELINE = """
 INSERT INTO baseline (
-    stage_id, concurrency, duration_s, bucket, n, n_ok, a1,
+    stage_id, concurrency, duration_s, duration_actual_s, bucket, n, n_ok, a1,
     ttft_p50_ms, ttft_p95_ms, ttft_p99_ms, tpot_p50_ms, tpot_p95_ms, tpot_p99_ms
 ) VALUES (
-    :stage_id, :concurrency, :duration_s, :bucket, :n, :n_ok, :a1,
+    :stage_id, :concurrency, :duration_s, :duration_actual_s, :bucket, :n, :n_ok, :a1,
     :ttft_p50_ms, :ttft_p95_ms, :ttft_p99_ms, :tpot_p50_ms, :tpot_p95_ms, :tpot_p99_ms
 )
 """
@@ -148,10 +152,12 @@ INSERT INTO baseline (
 _UPDATE_STAGE = """
 UPDATE stages SET
     n_total=:n_total, n_ok=:n_ok, n_failed=:n_failed, n_aborted=:n_aborted,
+    n_warmup=:n_warmup, actual_duration_s=:actual_duration_s,
     a1=:a1, a2=:a2, a3=:a3, slo=:slo, sla=:sla,
     ttft_p50_ms=:ttft_p50_ms, ttft_p90_ms=:ttft_p90_ms, ttft_p99_ms=:ttft_p99_ms,
     tpot_p50_ms=:tpot_p50_ms, tpot_p90_ms=:tpot_p90_ms, tpot_p99_ms=:tpot_p99_ms,
     e2e_p50_ms=:e2e_p50_ms, e2e_p99_ms=:e2e_p99_ms,
+    connect_p50_ms=:connect_p50_ms, connect_p99_ms=:connect_p99_ms,
     rps=:rps, output_tps=:output_tps,
     prompt_tokens_avg=:prompt_tokens_avg, completion_tokens_avg=:completion_tokens_avg,
     fail_kinds_json=:fail_kinds_json, ended_at=:ended_at
@@ -185,6 +191,27 @@ class RecordStore:
         if "n_aborted" not in cols:
             self._conn.execute(
                 "ALTER TABLE stages ADD COLUMN n_aborted INTEGER DEFAULT 0"
+            )
+        if "connect_p50_ms" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN connect_p50_ms REAL"
+            )
+        if "connect_p99_ms" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN connect_p99_ms REAL"
+            )
+        if "actual_duration_s" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN actual_duration_s REAL"
+            )
+        # baseline 表在旧版本数据库中可能已存在（无 duration_actual_s 列）
+        base_cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(baseline)")
+        }
+        if base_cols and "duration_actual_s" not in base_cols:
+            self._conn.execute(
+                "ALTER TABLE baseline ADD COLUMN duration_actual_s REAL"
             )
 
     # ------------------------------------------------------------------ #
@@ -282,6 +309,7 @@ class RecordStore:
                 "stage_id": stage_id,
                 "concurrency": concurrency,
                 "duration_s": duration_s,
+                "duration_actual_s": getattr(result, "duration_actual_s", None),
                 "bucket": entry.bucket,
                 "n": entry.n,
                 "n_ok": entry.n_ok,
@@ -310,9 +338,11 @@ class RecordStore:
         rows = self._conn.execute("SELECT * FROM baseline ORDER BY bucket").fetchall()
         if not rows:
             return None
+        has_actual = "duration_actual_s" in rows[0].keys()
         result = BaselineResult(
             concurrency=rows[0]["concurrency"] or 0,
             duration_s=rows[0]["duration_s"] or 0.0,
+            duration_actual_s=rows[0]["duration_actual_s"] if has_actual else None,
             buckets=[
                 BucketBaseline(
                     bucket=r["bucket"],

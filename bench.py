@@ -11,6 +11,7 @@
     # 2) 命令行覆盖关键参数（不改配置文件）
     python bench.py --config config.toml --base-url http://router:8000 \
         --model qwen --steps 8,16,32,64 --duration 60 --warmup 10
+    #    --duration 会按 5 倍联动单级延长上限；需要其他上限用 --max-duration
 
     # 3) 仅由已有数据库重新生成报告
     python bench.py --report-only --db results/bench_xxx.db --config config.toml
@@ -54,6 +55,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--steps", help="覆盖并发梯度，逗号分隔，如 8,16,32,64")
     parser.add_argument("--duration", type=float, help="覆盖每级稳压时长（秒）")
     parser.add_argument("--warmup", type=float, help="覆盖每级预热时长（秒）")
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        help="覆盖单级自适应延长上限（秒）；不指定时随 --duration 按 5 倍联动",
+    )
     parser.add_argument("--db", help="覆盖数据库输出路径")
     parser.add_argument("--report", help="覆盖报告输出路径")
     parser.add_argument("--probe", action="store_true", help="仅做连通性/单请求探针，不压测")
@@ -90,6 +96,17 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> None:
     cfg.service.path = overrides.pop("path") or cfg.service.path
     cfg.load.stage_duration_s = overrides.pop("stage_duration_s") or cfg.load.stage_duration_s
     cfg.load.warmup_s = overrides.pop("warmup_s") if overrides["warmup_s"] is not None else cfg.load.warmup_s
+    # 延长上限与名义时长联动：默认配置即 5 倍（60s → 300s）。若 --duration 单独
+    # 覆盖而 max_stage_duration_s 保持配置值，快速验证场景（如 --duration 6）
+    # 的单级仍可能被延长到 300s（50 倍），与调用意图相悖。
+    if args.max_duration:
+        if args.max_duration < cfg.load.stage_duration_s:
+            raise ConfigError(
+                f"--max-duration({args.max_duration}) 不能小于每级时长({cfg.load.stage_duration_s})"
+            )
+        cfg.load.max_stage_duration_s = args.max_duration
+    elif args.duration:
+        cfg.load.max_stage_duration_s = max(args.duration * 5.0, 30.0)
     cfg.storage.db_path = overrides.pop("db_path") or cfg.storage.db_path
     cfg.report.output_path = overrides.pop("report_path") or cfg.report.output_path
     if args.steps:
@@ -197,6 +214,8 @@ def _stats_from_store(store: RecordStore, cfg: Config):
             ttft_p50_ms=row["ttft_p50_ms"], ttft_p90_ms=row["ttft_p90_ms"], ttft_p99_ms=row["ttft_p99_ms"],
             tpot_p50_ms=row["tpot_p50_ms"], tpot_p90_ms=row["tpot_p90_ms"], tpot_p99_ms=row["tpot_p99_ms"],
             e2e_p50_ms=row["e2e_p50_ms"], e2e_p99_ms=row["e2e_p99_ms"],
+            connect_p50_ms=row["connect_p50_ms"] if "connect_p50_ms" in keys else None,
+            connect_p99_ms=row["connect_p99_ms"] if "connect_p99_ms" in keys else None,
             rps=row["rps"], output_tps=row["output_tps"],
             prompt_tokens_avg=row["prompt_tokens_avg"], completion_tokens_avg=row["completion_tokens_avg"],
             ttft_target_ms=cfg.slo.ttft_target_s * 1000.0,

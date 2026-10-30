@@ -16,7 +16,9 @@ verify_tls = false
 # extra_headers = { "X-Tenant-Id" = "demo" }
 
 [slo]
-# TTFT 目标（首 token 时间），秒
+# TTFT 目标（首 token 时间），秒。口径为客户端视角：从建连前起算，
+# 含 TCP/TLS 建连与请求写出；建连开销单独记录为 connect_ms 并在报告中给出分位数，
+# 跨机房/TLS 部署下解读时应予扣除
 ttft_target_s = 2.0
 # TPOT 目标（每输出 token 时间），毫秒
 tpot_target_ms = 50.0
@@ -41,8 +43,11 @@ mode = "closed"
 concurrency_steps = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
 # 每级稳压时长（秒）；闭环低压级别样本产出受单请求 E2E 限制，样本不足会自动延长
 stage_duration_s = 60.0
-# 每级稳压时长的自适应上限（秒）：测量段样本不足 min_samples_per_stage 时逐级延长至此为止，
-# 防止"并发 1、E2E≈3.5s 时 60s 仅 17 个样本"导致低压优质级别被整体排除在容量判定外
+# 每级稳压时长的自适应上限（秒）：测量段样本不足时逐级延长至此为止，
+# 防止"并发 1、E2E≈3.5s 时 60s 仅 17 个样本"导致低压优质级别被整体排除在容量判定外。
+# 正式级按"测量段总量"判定；Phase 0 基线按"最短样本长度桶"判定（门限是按桶解析的，
+# 总量够而最短桶不够照样回退 absolute）。命令行 --duration 覆盖时本上限按 5 倍联动，
+# 可用 --max-duration 显式指定
 max_stage_duration_s = 300.0
 # 每级预热时长（秒），预热数据不计入统计
 warmup_s = 10.0
@@ -66,8 +71,9 @@ max_inflight = 4096
 baseline_enabled = true
 # 基线并发：必须低到不触发排队/拒绝，且小于最小的 concurrency_step
 baseline_concurrency = 1
-# 基线时长：需保证每个长度桶都有足量样本（>= analysis.min_samples_per_stage），
-# 否则该桶门限回退为 absolute 配置值并在报告中标注
+# 基线时长：需保证每个长度桶都有足量样本（>= analysis.baseline_min_samples），
+# 否则该桶门限回退为 absolute 配置值并在报告中标注。样本不足时基线会自动延长
+# （判据：最短样本桶；上限同 max_stage_duration_s），实际时长与配置时长都会记录
 baseline_duration_s = 30.0
 baseline_warmup_s = 5.0
 
@@ -109,6 +115,12 @@ slo_target = 0.95
 # 闭环模式下请结合 max_stage_duration_s 评估可达性：并发 1、E2E≈3.5s 时
 # 300s 约产出 85 个样本
 min_samples_per_stage = 60
+# baseline_relative 模式下每个【长度桶】各自的样本量门限（级统计量与桶统计量
+# 的判定粒度不同，故分开配置）。桶内成功样本少于此值时该桶门限回退 absolute。
+# 按 prompt 权重 [0.2, 0.5, 0.3] 反推：最短桶要 30 个样本共需 150 个总样本；
+# 基线阶段会按"最短样本桶"自适应延长，结束仍不足时给出还差多少/约需多久的提示。
+# 调大提高 p99 置信度但拉长基线时长；调小反之（会降低 p99 置信度）
+baseline_min_samples = 30
 
 [storage]
 # 留空则自动生成 results/bench_<时间戳>.db

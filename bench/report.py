@@ -99,8 +99,15 @@ def _render_baseline_section(
         return lines
 
     index = {b.bucket: b for b in baseline.buckets}
+    dur_txt = f"配置 {baseline.duration_s:.0f}s"
+    actual = baseline.duration_actual_s
+    if actual is not None and actual > baseline.duration_s * 1.05:
+        dur_txt += (
+            f"，为补齐各长度桶样本量自适应延长至 {actual:.0f}s"
+            f"（硬上限 load.max_stage_duration_s）"
+        )
     lines.append(
-        f"Phase 0 在并发 {baseline.concurrency}、{baseline.duration_s:.0f}s 的低压下测量无压力时延。"
+        f"Phase 0 在并发 {baseline.concurrency} 的低压下测量无压力时延（{dur_txt}）。"
         "基线只统计分位数与失败数，不做达标判定——基线是尺子的来源，再拿它判定会形成循环。"
     )
     lines.append("")
@@ -110,7 +117,14 @@ def _render_baseline_section(
         b = index[i]
         ttft_limit = thresholds.ttft_limit(i) if thresholds else None
         tpot_limit = thresholds.tpot_limit(i) if thresholds else None
-        src = "回退 absolute" if (thresholds and i in thresholds.fallback_buckets) else "基线×系数"
+        if thresholds is None:
+            src = "n/a"
+        elif thresholds.mode == "absolute":
+            src = "absolute 配置值"
+        elif i in thresholds.fallback_buckets:
+            src = "回退 absolute"
+        else:
+            src = "基线×系数"
         rows.append([
             bucket_label(i, buckets),
             str(b.n_ok),
@@ -270,6 +284,16 @@ def build_conclusions(
                 f"并发 {finding.knee_concurrency} 起 SLA 跌破 {sla_target:.1%}"
                 f"（{_pct(knee.sla, 3)}），{shape}。"
             )
+
+    # ---- 5) 容量判定的补充说明 ----
+    # find_capacity 产生的 notes（未观测到拐点、SLA 重新达标抖动、零样本级别、
+    # 样本充足级别无双达标等）必须出现在结论里：例如“SLA 容量 = 梯度最后一级”
+    # 若不说明，读者会把它当成服务上限。
+    # 注意：调用方会给每个 item 加 "- " 前缀，这里不要再自带项目符号或空行。
+    if finding.notes:
+        lines.append("容量判定的补充说明：")
+        for note in finding.notes:
+            lines.append(note)
     return lines
 
 
@@ -427,7 +451,8 @@ def render_report(
                  "分别定位 3 个 9（SLA 口径）与 SLO 口径对应的最高并发（连续前缀规则），"
                  "并以两者同时达标的**质量容量**作为生产并发建议基准。")
     lines.append("6. 闭环低压级别的样本产出受单请求 E2E 限制，测量段样本不足时本级自动延长"
-                 "（上限 load.max_stage_duration_s）；本级结束时仍在途的请求记为放弃"
+                 "（上限 load.max_stage_duration_s；基线阶段按“最短长度桶”判定，"
+                 "因为门限是按桶解析的）；本级结束时仍在途的请求记为放弃"
                  "（aborted），不计入比率。")
     if cfg.slo.target_mode == "baseline_relative":
         lines.append(
@@ -504,6 +529,17 @@ def render_report(
         lines.append(f"（单位 ms；门限线：TTFT {cfg.slo.ttft_target_s * 1000:.0f}ms / "
                      f"TPOT {cfg.slo.tpot_target_ms:.0f}ms）")
     lines.append("")
+    conn = [(s.concurrency, s.connect_p50_ms, s.connect_p99_ms) for s in stages
+            if s.connect_p50_ms is not None]
+    if conn:
+        peak = max(conn, key=lambda x: x[2] or 0.0)
+        lines.append(
+            f"> TTFT/E2E 为客户端视角口径，含建连+请求写出时间（每请求独立连接）。"
+            f"各级 connect p50/p99 最高为并发 {peak[0]} 的 "
+            f"{_ms(peak[1])}/{_ms(peak[2])}ms；若该项占比可观（跨机房/TLS 场景），"
+            "解读 TTFT 时应予扣除，或把压测客户端部署到靠近服务的网络位置。"
+        )
+        lines.append("")
 
     # A1 构成 --------------------------------------------------------------
     lines.append("## 六、失败请求（A1）构成")
@@ -544,12 +580,17 @@ def render_report(
             row = [str(s.concurrency)]
             for i in all_buckets:
                 e = s.bucket_stats.get(i, {})
-                row.append(f"{e.get('a3', 0)}/{e.get('a2', 0) + e.get('a3', 0)}")
+                # 分母用桶内总数（含 A1）：排除 A1 会让 A3 占比虚高
+                row.append(f"{e.get('a3', 0)}/{e.get('n', 0)}")
             rows.append(row)
         lines.append(_table(
-            ["并发"] + [f"A3/A2（{bucket_label(i, cfg.requests.length_buckets)}）" for i in all_buckets],
+            ["并发"] + [f"A3/样本（{bucket_label(i, cfg.requests.length_buckets)}）" for i in all_buckets],
             rows,
         ))
+        lines.append("")
+        lines.append(
+            "> 口径：桶内 A3 数 / 桶内总样本数（含 A1，与分级表的 SLA/SLO 分母一致）。"
+        )
         lines.append("")
         lines.append(
             "> 读法：若 A3 集中在长 prompt 桶而短 prompt 桶仍全 A2，劣化源于 prefill 侧"

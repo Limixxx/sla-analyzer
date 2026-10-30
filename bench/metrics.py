@@ -67,6 +67,9 @@ class StageStats:
     concurrency: int
     duration_s: float
     warmup_s: float
+    # 实际运行时长（含自适应延长）；与 duration_s（配置值）分开，
+    # 保证“配置 30s、实际跑了 3 分钟”在日志与报告中都可审计。
+    actual_duration_s: Optional[float] = None
 
     n_total: int = 0
     n_warmup: int = 0
@@ -95,6 +98,8 @@ class StageStats:
     tpot_p99_ms: Optional[float] = None
     e2e_p50_ms: Optional[float] = None
     e2e_p99_ms: Optional[float] = None
+    connect_p50_ms: Optional[float] = None   # 建连+写出+等响应头；TTFT/E2E 的客户端视角组成部分
+    connect_p99_ms: Optional[float] = None
 
     rps: Optional[float] = None
     output_tps: Optional[float] = None
@@ -232,6 +237,7 @@ def compute_stage_stats(
     ttfts = [r["ttft_ms"] for r in ok_rows if r.get("ttft_ms") is not None]
     tpots = [r["tpot_ms"] for r in ok_rows if r.get("tpot_ms") is not None]
     e2es = [r["e2e_ms"] for r in ok_rows if r.get("e2e_ms") is not None]
+    connects = [r["connect_ms"] for r in ok_rows if r.get("connect_ms") is not None]
 
     stats.ttft_p50_ms = percentile(ttfts, 0.50)
     stats.ttft_p90_ms = percentile(ttfts, 0.90)
@@ -243,6 +249,8 @@ def compute_stage_stats(
     stats.tpot_p99_ms = percentile(tpots, 0.99)
     stats.e2e_p50_ms = percentile(e2es, 0.50)
     stats.e2e_p99_ms = percentile(e2es, 0.99)
+    stats.connect_p50_ms = percentile(connects, 0.50)
+    stats.connect_p99_ms = percentile(connects, 0.99)
 
     # 吞吐口径：按请求自身的墙钟时间窗计算（含 drain 尾巴），
     # 避免用名义稳压窗口衡量跨窗口完成的请求导致系统性低估。
@@ -357,6 +365,20 @@ def find_capacity(stages: Sequence[StageStats], analysis: AnalysisConfig) -> Cap
         finding.sla_capacity = last_sla.concurrency
         finding.sla_at_sla_capacity = last_sla.sla
         finding.slo_at_sla_capacity = last_sla.slo
+        if not any(s.concurrency > last_sla.concurrency for s in sufficient):
+            higher = [s for s in ordered if s.concurrency > last_sla.concurrency]
+            if higher:
+                finding.notes.append(
+                    f"SLA 容量 {last_sla.concurrency} 之上还有压力级 "
+                    f"{', '.join(str(s.concurrency) for s in higher)}，但样本不足 "
+                    f"{analysis.min_samples_per_stage} 个、未参与前缀判定。"
+                )
+            else:
+                finding.notes.append(
+                    f"已测至最高并发 {ordered[-1].concurrency} 仍满足 SLA 目标 "
+                    f"{analysis.sla_target:.3%}，未观测到 SLA 拐点；该值只是测试梯度的上限，"
+                    "不代表服务实际上限，如需确认应继续提高压力级。"
+                )
 
     # --- SLO 容量（样本充足连续前缀）---
     last_slo = _prefix_last_ok(sufficient, lambda s: s.slo >= analysis.slo_target)

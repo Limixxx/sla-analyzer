@@ -86,9 +86,14 @@ TTFT ──────────────── 流结束
   首 token 时间          每 token 平均间隔（TPOT）
 ```
 
-- **TTFT（Time To First Token）= 请求写出完成 → 首个含内容的 chunk**。
-  包含网络、Router 排队、调度、prefill 计算。PD 分离架构中
-  prefill 计算量随 prompt 长度近似线性增长，因此 TTFT 与 prompt 长度强相关。
+- **TTFT（Time To First Token）= 客户端视角的首 token 等待**。
+  计时从建连之前开始（`client.py` 的 `t_start`），因此包含 TCP/TLS 建连、
+  请求写出、网络、Router 排队、调度、prefill 计算。选这个口径是因为
+  **用户感知到的就是这段等待**；建连开销单独记录为 `connect_ms`
+  （建连+写出+等响应头），报告中给出各级 p50/p99，跨机房/TLS 部署下
+  占比可观时应予扣除或把客户端部署到靠近服务的网络位置。
+  PD 分离架构中 prefill 计算量随 prompt 长度近似线性增长，
+  因此 TTFT 与 prompt 长度强相关。
 - **TPOT（Time Per Output Token）= 首 token → 末 token 的平均每 token 间隔**。
   反映 decode 侧稳态吞吐，由 batch 调度、KV cache 带宽决定，
   与输出长度关系较弱（若不考虑 KV 随上下文增长导致的减速）。
@@ -115,9 +120,10 @@ TPOT 分母过小、统计噪声极大，不参与 TPOT 判定（`classify` 中
 | --- | --- | --- |
 | 成功但 0 输出 token | 判 A1（`empty_completion`） | 对用户无任何信息量，等同失败 |
 | 流异常结束且无内容 | 判 A1（`incomplete`） | 半截流不可用 |
-| 本级结束仍在途 | 记 `aborted`，**不计入 A1/A2/A3** | 无法判定成败；计入会同时污染两个口径（见 04.1） |
+| 本级结束仍在途 | 记 `aborted`，**不计入 A1/A2/A3** | 无法判定成败；计入会同时污染两个口径（见 04.1）。`sent_at` 记录真实发出时刻，供审计 |
 | 预热段请求 | 落库但统计时排除 | 冷启动不反映稳态（见 04.2） |
 | 无 usage 字段 | `chars_per_token` 估算 token 数，落 `token_source=estimated` | 估算仅用于分桶近似，报告中给出偏差告警（见 04.7） |
+| 正式压力级的每条请求 | 落库时即回填 `latency_class`（A1/A2/A3） | requests 表可直接按类别检索，无需重算（见 03 章门限） |
 
 ## 1.6 实现映射
 

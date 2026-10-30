@@ -119,6 +119,13 @@ class AnalysisConfig:
     # （并发 1、E2E≈3.5s 时 60s 仅约 17 个样本），因此 runner 会在
     # 测量段样本不足时自动延长本级（上限 load.max_stage_duration_s）；
     # 仍不足的级别以"低置信度参考"进入结论，不直接丢弃。
+    #
+    # baseline_relative 模式下每个【长度桶】都要单独达到样本量才不回退
+    # absolute 门限，因此基线阶段用独立的（通常更小的）门限：按权重
+    # [0.2, 0.5, 0.3] 反推，最短桶要 floor 个样本共需 floor/min(权重)
+    # 个总样本（默认 30 → 150 个）。基线阶段的自适应延长以此判据驱动，
+    # 结束时会给出"还需多少样本/多少秒"的量化提示。
+    baseline_min_samples: int = 30
 
 
 @dataclass
@@ -177,6 +184,7 @@ class Config:
             "sla_target": self.analysis.sla_target,
             "slo_target": self.analysis.slo_target,
             "min_samples_per_stage": self.analysis.min_samples_per_stage,
+            "baseline_min_samples": self.analysis.baseline_min_samples,
             "prompt_token_targets": list(self.requests.prompt_token_targets),
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
@@ -378,6 +386,7 @@ def load_config(path: str) -> Config:
         sla_target=_optional(ana_raw, "sla_target", AnalysisConfig.sla_target, float, "analysis"),
         slo_target=_optional(ana_raw, "slo_target", AnalysisConfig.slo_target, float, "analysis"),
         min_samples_per_stage=_optional(ana_raw, "min_samples_per_stage", AnalysisConfig.min_samples_per_stage, int, "analysis"),
+        baseline_min_samples=_optional(ana_raw, "baseline_min_samples", AnalysisConfig.baseline_min_samples, int, "analysis"),
     )
 
     storage = StorageConfig(db_path=str(sto_raw.get("db_path", "")))
@@ -467,6 +476,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("analysis.slo_target 必须在 (0, 1] 区间")
     if a.min_samples_per_stage <= 0:
         raise ConfigError("analysis.min_samples_per_stage 必须为正数")
+    if a.baseline_min_samples <= 0:
+        raise ConfigError("analysis.baseline_min_samples 必须为正数")
 
     # --- SLO 门限来源 ---
     if cfg.slo.target_mode not in ("absolute", "baseline_relative"):

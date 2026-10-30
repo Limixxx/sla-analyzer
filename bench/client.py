@@ -1,10 +1,12 @@
 """单请求执行器：构造 OpenAI 兼容请求、消费 SSE 流、产出 RequestResult。
 
 时间口径（全部基于 time.monotonic()，与墙钟无关，避免系统时钟抖动）：
-- connect_ms : 建连耗时
-- ttft_ms    : 请求写出完成 → 首个含内容的 chunk（首 token 时间）
+- connect_ms : 建连 + 请求写出 + 等待响应头 的耗时（open_stream 全程）
+- ttft_ms    : 客户端视角首 token 时间 = connect_ms + 请求写出完成 → 首个含
+               内容 chunk。包含建连与写出时间，是用户实际感知到的等待；
+               跨部署对比时需同时看 connect_ms（TLS/远距离下该项可能占大头）
 - tpot_ms    : 首 token → 末 token 之间，平均每个输出 token 的间隔
-- e2e_ms     : 请求写出完成 → 流结束
+- e2e_ms     : 客户端视角全程 = connect_ms + 请求写出完成 → 流结束
 """
 
 from __future__ import annotations
@@ -124,9 +126,15 @@ async def execute_request(
     mode: str = "closed",
 ) -> RequestResult:
     """执行单次请求，整体受 svc.timeout_s 保护（分钟级请求的关键保护）。"""
+    # sent_at 在进入 wait_for 之前取一次：外层超时处理器重建 Result 时必须
+    # 复用这个时刻。若在超时触发时才取 time.time()，该值最多晚 600s，
+    # 会把吞吐统计的墙钟窗口（last_end）整体推晚，RPS 被系统性低估。
+    sent_at = time.time()
     try:
         return await asyncio.wait_for(
-            _execute_request_inner(svc, req, prompt, spec, stage_id, concurrency, worker_id, is_warmup, mode),
+            _execute_request_inner(
+                svc, req, prompt, spec, stage_id, concurrency, worker_id, is_warmup, mode, sent_at
+            ),
             timeout=svc.timeout_s,
         )
     except asyncio.TimeoutError:
@@ -136,7 +144,7 @@ async def execute_request(
             worker_id=worker_id,
             is_warmup=is_warmup,
             mode=mode,
-            sent_at=time.time(),
+            sent_at=sent_at,
             prompt_tokens_planned=spec.prompt_tokens_target,
             max_tokens=spec.max_tokens,
             error_kind=KIND_TIMEOUT,
@@ -155,6 +163,7 @@ async def _execute_request_inner(
     worker_id: int,
     is_warmup: int,
     mode: str,
+    sent_at: float,
 ) -> RequestResult:
     result = RequestResult(
         stage_id=stage_id,
@@ -162,7 +171,7 @@ async def _execute_request_inner(
         worker_id=worker_id,
         is_warmup=is_warmup,
         mode=mode,
-        sent_at=time.time(),
+        sent_at=sent_at,
         prompt_tokens_planned=spec.prompt_tokens_target,
         max_tokens=spec.max_tokens,
     )

@@ -33,9 +33,11 @@ SLA 与 SLO，并评估达到 **3 个 9 可用性（99.9%）** 所能承受的�
 > **质量容量**（SLA 与 SLO 同时达标的最高连续前缀并发）为唯一基准，
 > SLA 容量仅作为 3 个 9 可用性参考单独陈述。
 
-时间口径（流式采集）：
+时间口径（流式采集，全部基于单调时钟）：
 
-- **TTFT** = 请求写出完成 → 首个含内容的 chunk
+- **TTFT** = 客户端视角的首 token 等待：从建连前起算，含 TCP/TLS 建连与请求写出
+  （用户实际感知的等待）。建连开销单独记录为 `connect_ms`，报告在延迟分布一节
+  给出各级 p50/p99——跨机房/TLS 部署下占比可观时应予扣除
 - **TPOT** = 首 token → 末 token 的平均每 token 间隔
 
 ## 2. 目录结构
@@ -95,6 +97,10 @@ python bench.py --config config.toml \
     --db results/run1.db --report results/run1.md
 ```
 
+> `--duration` 会按 5 倍联动单级自适应延长上限（与默认配置 60s→300s 同比例），
+> 避免快速验证场景（如 `--duration 6`）的单级仍按配置的 300s 上限延长；
+> 需要其他上限时用 `--max-duration <秒>` 显式指定。
+
 从已有数据库重建报告（改判定门限后复盘特别有用）：
 
 ```bash
@@ -119,7 +125,7 @@ python bench.py --config config.toml --no-baseline
 
 0. **Phase 0 基线剖析**（`load.baseline_enabled=true` 时）：正式 ramp 之前用低压并发
    测量无压力时延，产出各长度桶分位数；仅 `baseline_relative` 模式下参与门限计算，
-   absolute 模式下也执行（供报告的质量退化率诊断表使用）。
+   absolute 模式下也执行（供报告的质量退化率诊断表使用）。基线只统计、不判定。
 1. **递增并发**：按 `concurrency_steps` 从低压到高压逐级施压，每级分预热段与测量段
    （预热数据不计入统计）。闭环（closed）模式下每个 worker 串行发请求，
    并发升高时后端饱和会依次表现为：排队（TTFT/TPOT 抬升 → A3 增多）→ 拒绝（A1 增多），
@@ -133,10 +139,17 @@ python bench.py --config config.toml --no-baseline
    **低置信度参考容量**，防止低压优质级别被整体丢弃。
 4. **低压自适应延时**：闭环模式下低压级别的样本产出速率受单请求 E2E 限制
    （并发 1、E2E≈3.5s 时 60s 仅约 17 个样本）。测量段样本不足时本级自动延长，
-   上限 `load.max_stage_duration_s`。
+   上限 `load.max_stage_duration_s`。两种判据对应两种"够用"：
+   **正式级按测量段总量**（`min_samples_per_stage`），
+   **基线阶段按最短样本长度桶**（`baseline_min_samples`）——门限是按桶解析的，
+   总量够而最短桶不够照样回退 absolute。延长会在日志中显式提示
+   （"仍不足/已补齐" + 硬上限 + 含 drain 的实际运行时长），
+   基线结束仍不足时给出"还差多少样本、约需多少秒、建议并发"的量化提示。
+   实际时长（`actual_duration_s`）与配置时长分开记录，报告中同时展示。
 5. **在途请求处理**：本级结束时仍未完成的请求记为"放弃"（`status=aborted`），
    单独计数、不计入 SLA/SLO 分母——否则最慢的请求被静默丢弃会造成存活者偏差
-   （时延分位数与 A3 占比被系统性低估）。
+   （时延分位数与 A3 占比被系统性低估）。`sent_at` 记录真实发出时刻，
+   保证时间戳可审计、吞吐窗口不被推晚。
 
 ## 5. 判定门限与基线定标
 
@@ -164,8 +177,12 @@ python bench.py --config config.toml --no-baseline
 
 - 基线**只统计分位数与失败数，不对 A2/A3 判定**——基线是尺子的来源，再拿它判
   达标会形成循环论证；
-- 样本不足 `analysis.min_samples_per_stage` 的桶，门限**回退为 absolute 配置值**
+- 样本不足 `analysis.baseline_min_samples` 的桶，门限**回退为 absolute 配置值**
   并在日志与报告中显式标注，绝不静默使用不可信的分位数；
+- 样本不足时基线按"最短样本长度桶"自适应延长（判据与正式级不同，因为门限是
+  按桶解析的），结束仍不足会给出"还差多少样本、约需多少秒、建议并发"的提示；
+- 配置时长与实际时长分开记录（`duration_s` / `duration_actual_s`），
+  报告中同时展示，避免"配置 30s"与"实际跑了 3 分钟"对不上；
 - 基线阶段出现失败请求会污染分位数，工具会在报告中提示降低基线并发或排查可用性；
 - `--baseline-only` 可只跑 Phase 0：换引擎后先确认各桶分位数与生效门限，再跑完整压测。
 
@@ -190,14 +207,15 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 | `slo.ttft_factor` / `slo.tpot_factor` | baseline_relative 的门限系数 | ≥ 1.0；系数越松达标越易，建议结合退化率表复核 |
 | `requests.length_buckets` | prompt 长度分桶上界 | 与生产流量长度分布匹配；留空按 `max_context_tokens` 推导 `[ctx/32, ctx/8]` |
 | `requests.prompt_token_targets` | prompt 长度分布 | **应镜像生产流量画像**；留空按 `max_context_tokens` 推导 `[ctx/64, ctx/16, ctx/4]` |
-| `load.baseline_concurrency` / `baseline_duration_s` | Phase 0 基线参数 | 并发必须低于最小压力级；时长保证每桶样本 ≥ `min_samples_per_stage` |
+| `load.baseline_concurrency` / `baseline_duration_s` | Phase 0 基线参数 | 并发必须低于最小压力级；时长保证每桶样本 ≥ `baseline_min_samples`（不足会自动延长并提示） |
 | `analysis.sla_target` | 可用性目标 | 3 个 9 = `0.999`；注意它只是"接得住"，生产建议看质量容量 |
 | `analysis.slo_target` | 质量目标 | 与 SLA 共同构成质量容量判定 |
 | `load.concurrency_steps` | 并发梯度 | 覆盖预期拐点两侧 |
-| `load.max_stage_duration_s` | 单级自适应延时上限 | 闭环低压级别样本不足时自动延长至此；默认 300s |
+| `load.max_stage_duration_s` | 单级自适应延时上限 | 闭环低压级别样本不足时自动延长至此；默认 300s。正式级按总量、基线按最短桶判定 |
 | `load.drain_timeout_s` | 在途请求等待上限 | **需大于最长 E2E**，否则最慢请求被记"放弃"导致时延低估 |
 | `load.max_requests_per_stage` | 测量段请求数上限 | 防止高压级（秒级拒绝）样本爆炸 |
-| `analysis.min_samples_per_stage` | 高置信度容量判定的样本门槛 | 结合 `max_stage_duration_s` 评估低压级可达性 |
+| `analysis.min_samples_per_stage` | 高置信度容量判定的样本门槛（级粒度） | 结合 `max_stage_duration_s` 评估低压级可达性 |
+| `analysis.baseline_min_samples` | 基线各长度桶的样本门槛（桶粒度） | 按权重反推总量需求（默认 30 / 最短桶权重 0.2 ≈ 150 个总样本）；不足的桶回退 absolute |
 
 完整字段见 `config.example.toml` 内注释。
 
@@ -205,19 +223,25 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 
 **SQLite（`results/bench_<ts>.db`）**：
 
-- `stages`：每级配置与聚合结果（A1/A2/A3、放弃数、SLA/SLO、分位数、RPS、输出 tok/s）。
-  `kind='stage'` 为正式压力级，`kind='baseline'` 为 Phase 0 基线级（不参与容量判定）
-- `requests`：逐请求**特征**（计划/实际 token 数、TTFT/TPOT/E2E、分类、失败类型），
-  **不保存原始请求与响应内容**
-- `stage_buckets`：每级按 prompt 长度桶的拆分（A2/A3 计数、超标归因、该桶生效门限）
-- `baseline`：Phase 0 各长度桶的时延分位数，是 baseline_relative 门限的来源
+- `stages`：每级配置与聚合结果（A1/A2/A3、放弃数、SLA/SLO、分位数、connect p50/p99、
+  RPS、输出 tok/s）。`kind='stage'` 为正式压力级，`kind='baseline'` 为 Phase 0
+  基线级（不参与容量判定）；`duration_s` 为配置时长、`actual_duration_s` 为实际时长
+  （含自适应延长与 drain 收尾）
+- `requests`：逐请求**特征**（计划/实际 token 数、connect/TTFT/TPOT/E2E、
+  `latency_class` 分类、失败类型），**不保存原始请求与响应内容**。
+  正式压力级的每条请求在落库时即回填 A1/A2/A3，可直接按类别检索
+- `stage_buckets`：每级按 prompt 长度桶的拆分（A1/A2/A3 计数、超标归因、该桶生效门限）
+- `baseline`：Phase 0 各长度桶的时延分位数（含实际时长），是 baseline_relative
+  门限的来源
 - `is_warmup=1` 为预热数据，统计时排除
 - `status='aborted'` 为本级结束时仍在途、超过 drain 上限被放弃的请求，不计入比率
+  （`sent_at` 仍为真实发出时刻）
 
-**Markdown 报告（`results/report_<ts>.md`）**：结论（质量容量 + 3 个 9 口径 + SLO 口径）
-→ 基线剖析与生效门限（含质量退化率表）→ 方法 → 分级结果（含 SLO 判定列）→ 延迟分布
-→ A1 构成 → A3 归因（TTFT/TPOT/双超标 + 按长度桶拆分）→ 特征覆盖（含计划 vs 实测
-长度偏差告警）→ 建议 → 附录。
+**Markdown 报告（`results/report_<ts>.md`）**：结论（质量容量 + 3 个 9 口径 + SLO 口径
++ 容量判定的补充说明）→ 基线剖析与生效门限（含按桶门限表"来源"列与质量退化率表）
+→ 方法 → 分级结果（含 SLO 判定列）→ 延迟分布（含 connect 开销提示）
+→ A1 构成 → A3 归因（TTFT/TPOT/双超标 + 按长度桶拆分）
+→ 特征覆盖（含计划 vs 实测长度偏差告警）→ 建议 → 附录。
 
 ## 8. 工具自测（无需真实服务）
 
@@ -239,15 +263,21 @@ python bench.py --config config.mock-demo.toml
 prompt 长度分布与长度分桶均**留空**——用于验证按上下文上限的自动推导
 （8K 上下文 → prompt [128, 512, 2048]、桶 [256, 1024]），推导来源会在启动横幅与
 报告"请求特征覆盖"一节标注。把 `[slo] target_mode` 改为 `baseline_relative`
-并适当增大 `load.baseline_duration_s`，还可验证基线定标口径。
+还可验证基线定标口径：基线阶段按"最短样本长度桶"自适应延长
+（门限 `analysis.baseline_min_samples`），样本仍不足的桶回退 absolute
+并在日志中给出"还差多少/约需多久/建议并发"的量化提示。
 
 ## 9. 使用注意与局限
 
 - **超时口径**：`timeout_s` 是单请求整体超时。分钟级请求下若设小了，慢请求会被记为
   A1（timeout）而非 A3，直接污染 SLA——上线前务必用 `--probe` 实测最长请求时长。
 - **样本量**：3 个 9 的判定需要足够样本（建议每级 ≥ 1000 条才能区分 99.9% 与 99.5%）。
-  闭环低压级别样本天然少，工具会自动延长本级（上限 `max_stage_duration_s`）；
-  仍不足的级别只作低置信度参考，报告中会明确标注。
+  闭环低压级别样本天然少，工具会自动延长本级（上限 `max_stage_duration_s`，
+  正式级按总量、基线阶段按最短长度桶判定）；仍不足的级别只作低置信度参考，
+  报告中会明确标注。
+- **时延口径**：TTFT/E2E 为客户端视角（含建连与请求写出）。跨机房/TLS 部署下
+  建连开销可能占 TTFT 相当比例——看报告延迟分布节的 connect p50/p99，
+  必要时把压测客户端部署到靠近服务的网络位置。
 - **排队型过载陷阱**：若服务过载时只排队不拒绝（A1=0、TTFT 持续抬升），
   SLA 会一直"达标"——此时请直接看 SLO 与质量容量结论，不要用 SLA 容量定生产并发。
 - **前缀缓存**：`unique_prefix=true` 会加少量 token 换取无缓存干扰的 TTFT；

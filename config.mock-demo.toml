@@ -6,8 +6,10 @@
 # 本配置的 [requests] 故意不配 prompt_token_targets / length_buckets：
 # 按 max_context_tokens=8192 自动推导为 prompt [128, 512, 2048]、桶 [256, 1024]，
 # 推导来源会在启动横幅与报告"请求特征覆盖"一节标注。
-# 验证 baseline_relative 口径：把 [slo] 的 target_mode 改为 baseline_relative，
-# 并适当增大 baseline_duration_s（保证每桶样本 >= analysis.min_samples_per_stage）。
+# 验证 baseline_relative 口径：把 [slo] 的 target_mode 改为 baseline_relative。
+# 基线阶段按"最短样本长度桶"自适应延长（门限 analysis.baseline_min_samples，
+# 默认 30；按权重 [0.2, 0.5, 0.3] 反推最短桶 30 个样本共需约 150 个总样本），
+# 样本仍不足的桶会回退 absolute 并在日志中给出"还差多少/约需多久"的提示。
 
 [service]
 base_url = "http://127.0.0.1:8123"

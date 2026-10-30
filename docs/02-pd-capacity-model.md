@@ -109,9 +109,26 @@ KV cache 布局都处于瞬态，前几秒的时延不代表稳态。
 远低于统计判定所需的样本量。若按固定时长收工，**低压优质级别
 会因为样本不足被整体排除在容量判定之外**，恰好丢失最重要的参照点。
 
-因此 `runner.py` 在测量段结束时检查：样本数 < `min_samples_per_stage`
-且未达 `max_stage_duration_s` 上限时，以 30s 步长自动延长本级。
-延长会在日志中显式提示，不是静默行为。
+因此 `runner.py` 在测量段结束时检查样本量，不足且未达
+`max_stage_duration_s` 上限时，以 30s 步长自动延长本级。
+延长会在日志中显式提示（含“仍不足/已补齐”与硬上限），不是静默行为。
+
+**两种判据，对应两种“够用”的定义**：
+
+| 阶段 | 判据 | 样本量门限 | 理由 |
+| --- | --- | --- | --- |
+| 正式压力级 | 测量段**总量** | `analysis.min_samples_per_stage` | 级统计量（SLA/SLO、分位数）是总量口径 |
+| Phase 0 基线 | **最短样本长度桶** | `analysis.baseline_min_samples` | 门限按桶解析：总量够而最短桶不够，照样回退 absolute |
+
+基线阶段按桶反推所需总量：最短桶占流量权重 `w_min` 时需
+`baseline_min_samples / w_min` 个总样本（默认 30 / 0.2 = 150）。
+延长结束仍不足时，日志给出量化提示（还差多少样本、按当前速率约需多少秒、
+建议把 `baseline_concurrency` 提到多少可在时限内完成），
+并明确告知这些桶的门限已回退 absolute——**不静默使用不可信的分位数**。
+
+另外，测量段样本为 0 时同样会延长：高压级的预热请求可能占满整个阶段
+时长，此时一个测量请求都没发出；若按“有样本才延长”处理，收场只会得到
+零样本级别，还会被误诊为 drain 窗口不足。
 
 ### 2.5.3 每级请求数上限
 
@@ -121,7 +138,8 @@ KV cache 布局都处于瞬态，前几秒的时延不代表稳态。
 ### 2.5.4 drain 窗口与在途请求
 
 本级结束时仍在途的请求等待 `drain_timeout_s`，超时后取消并记为
-`aborted`。drain 窗口必须大于最长合法 E2E，否则最慢的请求
+`aborted`（`sent_at` 仍记录真实发出时刻，而非取消时刻，保证可审计）。
+drain 窗口必须大于最长合法 E2E，否则最慢的请求
 （恰恰是 A3 的主要候选）会被系统性丢弃——这是存活者偏差，
 详见 04.1。
 
@@ -151,6 +169,12 @@ SLO ┤ ████████████░░░░░░░░
 这防止低压优质级别因样本量被无声丢弃，也防止把
 低置信结论包装成高置信建议。
 
+`find_capacity` 产生的全部 notes（未观测到拐点、SLA 重新达标抖动、
+零样本级别、样本充足级别无双达标等）都会渲染进报告结论的
+"容量判定的补充说明"——例如"3 个 9 容量 = 梯度最后一级"必须附带
+"未观测到 SLA 拐点，该值只是测试梯度上限"，否则读者会把它
+当成服务上限。
+
 三个容量口径分别陈述（01 章的口径在此落地）：
 
 | 口径 | 定义 | 用途 |
@@ -175,9 +199,10 @@ SLO ┤ ████████████░░░░░░░░
 
 | 概念 | 位置 |
 | --- | --- |
-| 压力编排（Phase 0 + ramp、预热、延长、drain） | `bench/runner.py::BenchmarkRunner` |
+| 压力编排（Phase 0 + ramp、预热、按桶/按量延长、drain） | `bench/runner.py::BenchmarkRunner` |
 | 在途请求放弃落库 | `bench/runner.py::_issue` 的 `CancelledError` 分支 |
-| 容量提炼（连续前缀、三口径、拐点） | `bench/metrics.py::find_capacity` |
+| 容量提炼（连续前缀、三口径、拐点、notes） | `bench/metrics.py::find_capacity` |
+| 结论渲染（含容量 notes） | `bench/report.py::build_conclusions` |
 | 分级落库 | `bench/store.py`（`stages` / `stage_buckets` 表） |
 | 模拟两阶段过载（自测） | `mock_server.py`（soft_capacity 排队 / hard_capacity 拒绝） |
 

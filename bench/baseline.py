@@ -90,6 +90,10 @@ class BaselineResult:
 
     concurrency: int = 0
     duration_s: float = 0.0
+    # 实际运行时长（含自适应延长）。与 duration_s 不一致时说明基线阶段
+    # 为了补齐各长度桶的样本量被延长了——报告与日志都必须如实展示，
+    # 否则"配置 30s"与"实际跑了 3 分钟"会对不上。
+    duration_actual_s: Optional[float] = None
     buckets: List[BucketBaseline] = field(default_factory=list)
     total_n: int = 0
     total_a1: int = 0
@@ -187,11 +191,21 @@ def resolve_thresholds(
 
     baseline_relative 模式下，样本不足或缺失的桶回退到 absolute 配置值，
     并在 notes 中说明——绝不静默使用一个不可信的分位数。
+
+    min_samples 默认值按模式区分：baseline_relative 用
+    analysis.baseline_min_samples（按桶判定，门槛天然更严），absolute 根本
+    不看样本量。所有调用点（runner 与 --report-only）共用这一默认值，
+    保证压测时与重建报告时解析出的门限一致。
     """
     slo: SloConfig = cfg.slo
     buckets = cfg.requests.length_buckets
     n_buckets = bucket_count(buckets)
-    min_samples = min_samples if min_samples is not None else cfg.analysis.min_samples_per_stage
+    if min_samples is None:
+        min_samples = (
+            cfg.analysis.baseline_min_samples
+            if slo.target_mode == "baseline_relative"
+            else cfg.analysis.min_samples_per_stage
+        )
 
     absolute_ttft = slo.ttft_target_s * 1000.0
     absolute_tpot = slo.tpot_target_ms
