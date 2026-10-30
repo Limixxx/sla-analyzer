@@ -293,6 +293,10 @@ async def _amain(args: argparse.Namespace) -> int:
         print(f"  目标      : SLA>={cfg.analysis.sla_target:.1%}  SLO>={cfg.analysis.slo_target:.1%}")
         print(f"  压力级    : {cfg.load.concurrency_steps}  每级 {cfg.load.stage_duration_s}s"
               f"（预热 {cfg.load.warmup_s}s）")
+        if cfg.derived_lengths:
+            print(f"  长度分布  : {'、'.join(cfg.derived_lengths)} 未显式配置，"
+                  f"按 max_context_tokens={cfg.requests.max_context_tokens} 自动推导"
+                  f"（prompt={cfg.requests.prompt_token_targets}，桶={cfg.requests.length_buckets}）")
         print(f"  数据库    : {cfg.storage.db_path}")
         print("=" * 72)
 

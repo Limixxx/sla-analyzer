@@ -3,6 +3,9 @@
 #   python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --ttft-per-1k-tokens 60 \
 #       --soft-capacity 8 --hard-capacity 12
 #   python bench.py --config config.mock-demo.toml
+# 本配置的 [requests] 故意不配 prompt_token_targets / length_buckets：
+# 按 max_context_tokens=8192 自动推导为 prompt [128, 512, 2048]、桶 [256, 1024]，
+# 推导来源会在启动横幅与报告"请求特征覆盖"一节标注。
 # 验证 baseline_relative 口径：把 [slo] 的 target_mode 改为 baseline_relative，
 # 并适当增大 baseline_duration_s（保证每桶样本 >= analysis.min_samples_per_stage）。
 
@@ -36,8 +39,6 @@ max_requests_per_stage = 800
 drain_timeout_s = 20.0
 
 [requests]
-prompt_token_targets = [256, 1024]
-prompt_weights = [0.5, 0.5]
 max_context_tokens = 8192
 output_token_choices = [32, 64]
 output_weights = [0.6, 0.4]
@@ -46,8 +47,8 @@ stream = true
 unique_prefix = true
 seed = 20241030
 chars_per_token = 3.5
-# ≤256 / 257-1024 / >1024 三桶；配合 mock 的 --ttft-per-1k-tokens 可验证按桶门限
-length_buckets = [256, 1024]
+# prompt_token_targets / prompt_weights / length_buckets 故意留空：
+# 按 max_context_tokens 自动推导为 [128, 512, 2048] 与桶 [256, 1024]
 
 [analysis]
 sla_target = 0.999

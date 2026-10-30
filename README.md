@@ -42,12 +42,10 @@ benchmark/
 ├── bench.py                  # CLI 入口（压测 / 探针 / 基线定标 / 报告重建）
 ├── mock_server.py            # 本地模拟推理服务（工具自测用，不用于生产）
 ├── config.example.toml       # 完整配置示例（复制为 config.toml 修改）
-├── config.mock-demo.toml     # 配合 mock_server 的自测配置
-├── config.reg-absolute.toml  # 回归自测：absolute 口径
-├── config.reg-baseline.toml  # 回归自测：baseline_relative 口径（含缺桶回退场景）
+├── config.mock-demo.toml     # 配合 mock_server 的自测配置（长度参数留空走自动推导）
 ├── requirements.txt          # 零依赖说明
 ├── bench/                    # 核心包
-│   ├── config.py             #   配置加载与校验（TOML/JSON）
+│   ├── config.py             #   配置加载、校验与长度参数自动推导
 │   ├── prompts.py            #   按 token 预算合成 prompt（唯一前缀防缓存）
 │   ├── httpclient.py         #   零依赖异步 HTTP/1.1 + SSE 客户端
 │   ├── client.py             #   单请求执行、TTFT/TPOT 采集、失败分类
@@ -181,7 +179,8 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 | `slo.ttft_target_s` / `slo.tpot_target_ms` | 质量门限（absolute 口径） | 按业务约定；先用 `--probe` 实测单请求时延再定 |
 | `slo.target_mode` | 门限来源 | `absolute` 验收用；`baseline_relative` 跨引擎适配用 |
 | `slo.ttft_factor` / `slo.tpot_factor` | baseline_relative 的门限系数 | ≥ 1.0；系数越松达标越易，建议结合退化率表复核 |
-| `requests.length_buckets` | prompt 长度分桶上界 | 与生产流量长度分布匹配；每个桶需有足量样本 |
+| `requests.length_buckets` | prompt 长度分桶上界 | 与生产流量长度分布匹配；留空按 `max_context_tokens` 推导 `[ctx/32, ctx/8]` |
+| `requests.prompt_token_targets` | prompt 长度分布 | **应镜像生产流量画像**；留空按 `max_context_tokens` 推导 `[ctx/64, ctx/16, ctx/4]` |
 | `load.baseline_concurrency` / `baseline_duration_s` | Phase 0 基线参数 | 并发必须低于最小压力级；时长保证每桶样本 ≥ `min_samples_per_stage` |
 | `analysis.sla_target` | 可用性目标 | 3 个 9 = `0.999`；注意它只是"接得住"，生产建议看质量容量 |
 | `analysis.slo_target` | 质量目标 | 与 SLA 共同构成质量容量判定 |
@@ -227,14 +226,11 @@ python bench.py --config config.mock-demo.toml
 （SLO 降而 SLA 不降）；超过 hard 容量后大量 503 落入 A1（SLA 断崖）；
 报告以**质量容量**定位生产并发（SLA 100% 但 SLO 归零的级别不会被推荐）。
 
-回归配置（快速全链路验证，每个约 1~2 分钟）：
-
-```bash
-python bench.py --config config.reg-absolute.toml    # absolute 口径：全桶统一门限
-python bench.py --config config.reg-baseline.toml    # baseline_relative：按桶门限 + 缺桶回退
-python bench.py --config config.reg-baseline.toml --baseline-only   # 仅 Phase 0 基线
-python bench.py --config config.reg-baseline.toml --report-only     # 从 DB 重建报告
-```
+`config.mock-demo.toml` 中的 `requests` 段故意只配 `max_context_tokens` 与输出长度，
+prompt 长度分布与长度分桶均**留空**——用于验证按上下文上限的自动推导
+（8K 上下文 → prompt [128, 512, 2048]、桶 [256, 1024]），推导来源会在启动横幅与
+报告"请求特征覆盖"一节标注。把 `[slo] target_mode` 改为 `baseline_relative`
+并适当增大 `load.baseline_duration_s`，还可验证基线定标口径。
 
 ## 9. 使用注意与局限
 

@@ -86,8 +86,13 @@ class LoadConfig:
 class RequestConfig:
     """请求特征生成规则。"""
 
-    prompt_token_targets: List[int] = field(default_factory=lambda: [512, 2048, 8192])
-    prompt_weights: List[float] = field(default_factory=lambda: [0.2, 0.5, 0.3])
+    # 以下三个长度参数【留空】时按 max_context_tokens 自动推导（见 _resolve_length_defaults）：
+    #   prompt_token_targets ← [ctx/64, ctx/16, ctx/4]，权重 [0.2, 0.5, 0.3]
+    #   length_buckets       ← [ctx/32, ctx/8]
+    # 对 32768 上下文精确复现历史默认值，对 8K/128K 等模型自动缩放。
+    # 显式配置永远优先——长度分布应镜像生产流量画像，而非模型能力上限。
+    prompt_token_targets: List[int] = field(default_factory=list)
+    prompt_weights: List[float] = field(default_factory=list)
     max_context_tokens: int = 32768   # 服务支持的上下文上限（prompt+output 必须不超过）
     output_token_choices: List[int] = field(default_factory=lambda: [128, 256])
     output_weights: List[float] = field(default_factory=lambda: [0.7, 0.3])
@@ -100,7 +105,7 @@ class RequestConfig:
     # 例 [1024, 4096] → ≤1024 / 1025-4096 / >4096 三桶。
     # 分桶的意义：TTFT 与 prompt 长度强相关，全局单门限会让长 prompt 请求
     # 天然落入 A3，掩盖真正的排队信号。
-    length_buckets: List[int] = field(default_factory=lambda: [1024, 4096])
+    length_buckets: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -136,6 +141,9 @@ class Config:
     storage: StorageConfig
     report: ReportConfig
     source_path: str = ""
+    # 本次运行中由 max_context_tokens 自动推导的字段名（如 ["prompt_token_targets"]）；
+    # 空列表表示长度参数全部为显式配置。仅用于日志/报告标注，可审计。
+    derived_lengths: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     def apply_overrides(self, **kw: Any) -> None:
@@ -172,6 +180,7 @@ class Config:
             "prompt_token_targets": list(self.requests.prompt_token_targets),
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
+            "derived_lengths": list(self.derived_lengths),
         }
 
 
@@ -227,6 +236,54 @@ def _field_default(cls: type, name: str) -> Any:
     if f.default_factory is not MISSING:
         return f.default_factory()
     return f.default
+
+
+# ---------------------------------------------------------------------- #
+# 长度参数自动推导（未显式配置时按 max_context_tokens 缩放）
+# ---------------------------------------------------------------------- #
+
+def _derive_prompt_mix(max_context: int) -> tuple:
+    """按上下文上限推导默认 prompt 长度分布：(targets, weights)。
+
+    取 [ctx/64, ctx/16, ctx/4] 三档 + "短多长少"权重 [0.2, 0.5, 0.3]，
+    各档设下限（32/64/128）防止极小上下文退化出无意义长度。
+    32768 → ([512, 2048, 8192], [0.2, 0.5, 0.3])，与历史默认一致。
+    """
+    plan = ((64, 0.2, 32), (16, 0.5, 64), (4, 0.3, 128))  # (分母, 权重, 下限)
+    targets = [max(floor, max_context // divisor) for divisor, _, floor in plan]
+    weights = [weight for _, weight, _ in plan]
+    return targets, weights
+
+
+def _derive_length_buckets(max_context: int) -> List[int]:
+    """按上下文上限推导默认分桶上界 [ctx/32, ctx/8]。
+
+    32768 → [1024, 4096]，与历史默认一致；8K → [256, 1024]。
+    两档设下限（64/256）；由于 ctx/8 > ctx/32 恒成立，推导结果必然严格递增。
+    """
+    return [max(64, max_context // 32), max(256, max_context // 8)]
+
+
+def _resolve_length_defaults(cfg: Config) -> None:
+    """长度参数缺省值解析：留空的 prompt 分布/分桶按 max_context_tokens 推导。
+
+    放在加载后、校验前，保证下游（PromptFactory / baseline / report）读到的
+    永远是具体值。显式配置永远优先——长度分布应镜像生产流量画像，
+    max_context_tokens 只是能力上限，不能代替流量假设。
+    """
+    r = cfg.requests
+    derived: List[str] = []
+    if not r.prompt_token_targets:
+        r.prompt_token_targets, r.prompt_weights = _derive_prompt_mix(r.max_context_tokens)
+        derived.append("prompt_token_targets")
+    elif not r.prompt_weights:
+        # 显式配了长度没配权重：等权，避免长度不一致直接报错
+        r.prompt_weights = [1.0 / len(r.prompt_token_targets)] * len(r.prompt_token_targets)
+        derived.append("prompt_weights")
+    if not r.length_buckets:
+        r.length_buckets = _derive_length_buckets(r.max_context_tokens)
+        derived.append("length_buckets")
+    cfg.derived_lengths = derived
 
 
 def load_config(path: str) -> Config:
@@ -302,10 +359,8 @@ def load_config(path: str) -> Config:
     )
 
     requests = RequestConfig(
-        prompt_token_targets=_int_list(req_raw, "prompt_token_targets", "requests")
-        or _field_default(RequestConfig, "prompt_token_targets"),
-        prompt_weights=_num_list(req_raw, "prompt_weights", "requests")
-        or _field_default(RequestConfig, "prompt_weights"),
+        prompt_token_targets=_int_list(req_raw, "prompt_token_targets", "requests") or [],
+        prompt_weights=_num_list(req_raw, "prompt_weights", "requests") or [],
         max_context_tokens=_optional(req_raw, "max_context_tokens", RequestConfig.max_context_tokens, int, "requests"),
         output_token_choices=_int_list(req_raw, "output_token_choices", "requests")
         or _field_default(RequestConfig, "output_token_choices"),
@@ -316,8 +371,7 @@ def load_config(path: str) -> Config:
         unique_prefix=_optional(req_raw, "unique_prefix", RequestConfig.unique_prefix, bool, "requests"),
         seed=_optional(req_raw, "seed", RequestConfig.seed, int, "requests"),
         chars_per_token=_optional(req_raw, "chars_per_token", RequestConfig.chars_per_token, float, "requests"),
-        length_buckets=_int_list(req_raw, "length_buckets", "requests")
-        or _field_default(RequestConfig, "length_buckets"),
+        length_buckets=_int_list(req_raw, "length_buckets", "requests") or [],
     )
 
     analysis = AnalysisConfig(
@@ -339,6 +393,7 @@ def load_config(path: str) -> Config:
         report=report,
         source_path=str(p),
     )
+    _resolve_length_defaults(cfg)
     validate(cfg)
     return cfg
 
@@ -375,8 +430,13 @@ def validate(cfg: Config) -> None:
     if l.mode == "open" and l.target_rps <= 0:
         raise ConfigError("open 模式下必须配置 load.target_rps > 0")
 
+    if r.max_context_tokens <= 0:
+        raise ConfigError("requests.max_context_tokens 必须为正整数（它是长度自动推导的基准）")
     if not r.prompt_token_targets or any(t <= 0 for t in r.prompt_token_targets):
-        raise ConfigError("requests.prompt_token_targets 必须为非空正整数数组")
+        raise ConfigError(
+            "requests.prompt_token_targets 必须为非空正整数数组"
+            "（留空则按 max_context_tokens 自动推导 [ctx/64, ctx/16, ctx/4]）"
+        )
     if not r.output_token_choices or any(t <= 0 for t in r.output_token_choices):
         raise ConfigError("requests.output_token_choices 必须为非空正整数数组")
     if len(r.prompt_weights) != len(r.prompt_token_targets):
@@ -390,9 +450,15 @@ def validate(cfg: Config) -> None:
 
     longest = max(r.prompt_token_targets) + max(r.output_token_choices)
     if longest > r.max_context_tokens:
+        hint = (
+            "（当前 prompt 长度为按 max_context_tokens 自动推导的默认值，"
+            "可显式配置 requests.prompt_token_targets 覆盖）"
+            if "prompt_token_targets" in cfg.derived_lengths
+            else "请下调长度或修正上下文上限"
+        )
         raise ConfigError(
             f"最长请求（prompt {max(r.prompt_token_targets)} + output {max(r.output_token_choices)} "
-            f"= {longest}）超过 max_context_tokens={r.max_context_tokens}，请下调长度或修正上下文上限"
+            f"= {longest}）超过 max_context_tokens={r.max_context_tokens}，{hint}"
         )
 
     if not (0.0 < a.sla_target <= 1.0):
@@ -427,7 +493,9 @@ def validate(cfg: Config) -> None:
 
     # --- 长度分桶 ---
     if not r.length_buckets:
-        raise ConfigError("requests.length_buckets 不能为空（至少需要一个上界，或显式配置）")
+        raise ConfigError(
+            "requests.length_buckets 不能为空（留空则按 max_context_tokens 自动推导 [ctx/32, ctx/8]）"
+        )
     if any(b <= 0 for b in r.length_buckets):
         raise ConfigError("requests.length_buckets 必须全为正整数")
     if any(b2 <= b1 for b1, b2 in zip(r.length_buckets, r.length_buckets[1:])):

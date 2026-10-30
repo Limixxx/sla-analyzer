@@ -560,11 +560,15 @@ def render_report(
     # 特征覆盖 -------------------------------------------------------------
     lines.append("## 八、请求特征覆盖")
     lines.append("")
+    derived = set(cfg.derived_lengths)
+    prompt_note = "（按 max_context_tokens 自动推导，建议按生产流量显式配置）" \
+        if "prompt_token_targets" in derived else ""
     lines.append(f"- 计划 prompt 长度分布（token）：{cfg.requests.prompt_token_targets}"
-                 f"（权重 {cfg.requests.prompt_weights}）")
+                 f"（权重 {cfg.requests.prompt_weights}）{prompt_note}")
     lines.append(f"- 计划输出长度分布（token）：{cfg.requests.output_token_choices}"
                  f"（权重 {cfg.requests.output_weights}）")
-    lines.append(f"- 上下文上限假设：{cfg.requests.max_context_tokens} token")
+    lines.append(f"- 上下文上限假设：{cfg.requests.max_context_tokens} token"
+                 + ("；长度分桶上界亦为自动推导" if "length_buckets" in derived else ""))
 
     def _weighted_mean(values: Sequence[float], weights: Sequence[float]) -> Optional[float]:
         total = float(sum(weights))

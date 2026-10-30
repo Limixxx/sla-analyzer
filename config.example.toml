@@ -72,8 +72,12 @@ baseline_duration_s = 30.0
 baseline_warmup_s = 5.0
 
 [requests]
-# prompt 长度目标（token）分布，需与 max_context_tokens 匹配
+# prompt 长度目标（token）分布。留空则按 max_context_tokens 自动推导
+# [ctx/64, ctx/16, ctx/4]（32768 → [512, 2048, 8192]，8K → [128, 512, 2048]）。
+# 显式配置永远优先：分布应镜像生产流量画像，而非模型能力上限——
+# 128K 模型若生产流量 90% 在 2K 以内，按上限推导会把容量拐点定位错误。
 prompt_token_targets = [512, 2048, 8192]
+# 各长度的采样权重；只配长度不配权重时按等权处理
 prompt_weights = [0.2, 0.5, 0.3]
 # 服务支持的上下文上限（prompt + output 不得超过）；从服务文档或 /v1/models 获取
 max_context_tokens = 32768
@@ -89,6 +93,7 @@ seed = 20241030
 chars_per_token = 3.5
 # prompt 长度分桶上界（token，左开右闭）；桶数 = 上界个数 + 1，最后一个桶无上界。
 # 例 [1024, 4096] → ≤1024 / 1025-4096 / >4096 三桶。
+# 留空则按 max_context_tokens 自动推导 [ctx/32, ctx/8]（32768 → [1024, 4096]）。
 # 分桶的意义：TTFT 与 prompt 长度强相关（prefill 计算量近似线性），全局单门限会让
 # 长 prompt 请求天然落入 A3，把"长度差异"混进"排队劣化"里。分桶后每个桶有独立
 # 门限（baseline_relative）或统一门限（absolute），A3 归因才能回答"是所有长度都
