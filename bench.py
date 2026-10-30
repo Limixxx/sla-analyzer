@@ -35,7 +35,7 @@ from pathlib import Path
 from bench import __version__
 from bench.baseline import resolve_thresholds
 from bench.config import Config, ConfigError, load_config
-from bench.metrics import StageStats, find_capacity
+from bench.metrics import StageStats, classify_watermark, find_capacity
 from bench.prompts import PromptFactory
 from bench.report import write_report
 from bench.runner import BenchmarkRunner
@@ -235,6 +235,11 @@ def _stats_from_store(store: RecordStore, cfg: Config):
                     "ttft_p99_ms": b["ttft_p99_ms"], "tpot_p99_ms": b["tpot_p99_ms"],
                     "ttft_limit_ms": b["ttft_limit_ms"], "tpot_limit_ms": b["tpot_limit_ms"],
                 }
+        # 水位状态按当前 [watermark] 配置现场重算（与门限解析一样幂等）；
+        # DB 中的 watermark_state 仅作审计留存，不以它为准
+        state, reasons = classify_watermark(entry, cfg.watermark)
+        entry.watermark_state = state
+        entry.watermark_reasons = reasons
         stats.append(entry)
     return stats, thresholds, baseline
 
@@ -310,6 +315,12 @@ async def _amain(args: argparse.Namespace) -> int:
             print(f"  门限      : baseline_relative（基线 p99 × TTFT {cfg.slo.ttft_factor} / "
                   f"TPOT {cfg.slo.tpot_factor}，按长度桶 {cfg.requests.length_buckets} 生效）")
         print(f"  目标      : SLA>={cfg.analysis.sla_target:.1%}  SLO>={cfg.analysis.slo_target:.1%}")
+        if cfg.watermark.enabled:
+            print(f"  水位      : 软=A3>={cfg.watermark.soft_slo_violation_ratio:.0%}，"
+                  f"硬=A1>={cfg.watermark.hard_reject_ratio:.0%} 或 "
+                  f"A3>={cfg.watermark.hard_slo_violation_ratio:.0%}"
+                  + (f"（TTFT p99>={cfg.watermark.soft_ttft_p99_ms:.0f}ms 亦判软）"
+                     if cfg.watermark.soft_ttft_p99_ms > 0 else ""))
         print(f"  压力级    : {cfg.load.concurrency_steps}  每级 {cfg.load.stage_duration_s}s"
               f"（预热 {cfg.load.warmup_s}s）")
         if cfg.derived_lengths:

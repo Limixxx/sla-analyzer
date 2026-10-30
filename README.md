@@ -6,7 +6,7 @@ SLA 与 SLO，并评估达到 **3 个 9 可用性（99.9%）** 所能承受的�
 零第三方依赖（Python ≥ 3.11 标准库），可直接拷贝进集群 Pod 内运行。
 
 > **方法论文档**：`docs/` 目录记录本工具的理论基础（指标体系、容量模型、
-> 门限定标、测量有效性），回答"为什么这样设计"；本 README 只讲"怎么用"。
+> 门限定标、测量有效性、水位语义），回答"为什么这样设计"；本 README 只讲"怎么用"。
 
 ---
 
@@ -56,7 +56,7 @@ benchmark/
 │   ├── client.py             #   单请求执行、TTFT/TPOT 采集、失败分类
 │   ├── stats.py              #   分位数（最近秩）与均值
 │   ├── baseline.py           #   长度分桶、Phase 0 基线剖析、门限解析
-│   ├── metrics.py            #   A1/A2/A3 分类、分位数、容量判定
+│   ├── metrics.py            #   A1/A2/A3 分类、分位数、容量与水位判定
 │   ├── store.py              #   SQLite 存储（只存特征，不存原文）
 │   ├── runner.py             #   Phase 0 + 递增并发编排（闭环/开环）
 │   └── report.py             #   Markdown 评估报告生成
@@ -65,7 +65,8 @@ benchmark/
 │   ├── 01-metrics-slo-sla.md #   指标体系：A1/A2/A3、SLA/SLO、TTFT/TPOT
 │   ├── 02-pd-capacity-model.md # 容量模型：PD 分离、两阶段过载、递增并发
 │   ├── 03-threshold-calibration.md # 门限定标：基线定标、长度分桶、退化率
-│   └── 04-measurement-validity.md # 测量有效性：偏差识别与控制
+│   ├── 04-measurement-validity.md # 测量有效性：偏差识别与控制
+│   └── 05-watermark.md       #   水位语义：服务端水位的黑盒投影（软/硬/SLA）
 └── results/                  # 输出目录（db + report）
 ```
 
@@ -150,6 +151,10 @@ python bench.py --config config.toml --no-baseline
    单独计数、不计入 SLA/SLO 分母——否则最慢的请求被静默丢弃会造成存活者偏差
    （时延分位数与 A3 占比被系统性低估）。`sent_at` 记录真实发出时刻，
    保证时间戳可审计、吞吐窗口不被推晚。
+6. **水位探测**：每级按可观测信号判定水位状态（见 5.5）：**NORMAL**（无信号）→
+   **BUSY**（软水位投影：A3 占比或 TTFT p99 超软门限，服务在排队）→
+   **OVERLOAD**（硬水位投影：出现拒绝或 A3 崩塌）。跨级汇总出软/硬/SLA
+   三个水位边界，供 Router 配置排队预警线与熔断线。
 
 ## 5. 判定门限与基线定标
 
@@ -195,6 +200,33 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 **质量退化率**（各级 p99 ÷ 基线 p99，与门限无关）共同回答：
 劣化是集中在长 prompt（指向 prefill 容量），还是各桶同步（全局排队/准入问题）。
 
+### 5.5 水位探测（服务端水位的黑盒投影）
+
+推理水位（触发限流/排队/熔断/扩缩容的负载状态阈值集合，详见
+[docs/05-watermark.md](docs/05-watermark.md)）分三层：**软水位**（BUSY，转入排队不拒绝）、
+**硬水位**（OVERLOAD，直接 429 拒绝）、**SLA 水位**（业务承诺反向驱动）。
+
+压测工具是黑盒客户端，看不到服务端的 KV Cache / 批 slot / GPU 等资源指标，
+因此判定的是**服务端水位的可观测投影**——服务端水位一旦被触达，必然通过
+排队与拒绝投影到客户端可见的信号上：
+
+| 水位状态 | 判定（OR 逻辑，`[watermark]` 配置） | 服务端对应行为 |
+| --- | --- | --- |
+| NORMAL | 各项可观测指标均在软门限之内 | 资源有余量 |
+| BUSY（软水位投影） | A3 占比 ≥ `soft_slo_violation_ratio`（默认 5%），或 TTFT p99 ≥ `soft_ttft_p99_ms`（0=关闭） | 转入排队/路由分流，不拒绝 |
+| OVERLOAD（硬水位投影） | A1 占比 ≥ `hard_reject_ratio`（默认 1%），或 A3 占比 ≥ `hard_slo_violation_ratio`（默认 50%） | 拒绝接入（429/503） |
+| unknown | 本级无完成样本 | 无法判定，不参与边界发现 |
+
+报告给出三个水位边界：**软水位并发**（首个 BUSY 级，排队预警线）、
+**硬水位并发**（首个 OVERLOAD 级，熔断线）、**SLA 水位并发**（= 质量容量，
+生产并发建议）。BUSY/OVERLOAD 级附带 A3 归因，指向劣化平面：
+TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode 平面
+（KV Cache/批 slot），与 PD 分离的双水位语义对齐。
+
+> 注意：这是水位的**投影**而非水位本身——软水位投影略滞后于服务端软水位触达
+> （需积累足够 A3 样本才能分辨）。真正的资源水位计算在服务端
+> （Prometheus 指标 + 监控分析器），两者互补而非替代。
+
 ## 6. 关键配置
 
 | 参数 | 说明 | 建议 |
@@ -216,6 +248,11 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 | `load.max_requests_per_stage` | 测量段请求数上限 | 防止高压级（秒级拒绝）样本爆炸 |
 | `analysis.min_samples_per_stage` | 高置信度容量判定的样本门槛（级粒度） | 结合 `max_stage_duration_s` 评估低压级可达性 |
 | `analysis.baseline_min_samples` | 基线各长度桶的样本门槛（桶粒度） | 按权重反推总量需求（默认 30 / 最短桶权重 0.2 ≈ 150 个总样本）；不足的桶回退 absolute |
+| `watermark.enabled` | 是否判定水位状态 | 关闭后分级表无"水位"列、结论区无水位边界陈述（其余结论不受影响） |
+| `watermark.soft_slo_violation_ratio` | 软水位（BUSY）门限：A3 占比 | 默认 5%；调小更早预警排队，调大更保守 |
+| `watermark.hard_slo_violation_ratio` | 硬水位（OVERLOAD）门限：A3 占比 | 默认 50%（过半不达标 = 质量崩塌） |
+| `watermark.hard_reject_ratio` | 硬水位（OVERLOAD）门限：A1 占比 | 默认 1%；服务端限流不会零星出现 |
+| `watermark.soft_ttft_p99_ms` | 软水位附加门限：TTFT p99 绝对值 | 默认 0（关闭）；开启后在 A3 尚少时提前报 BUSY，跨引擎对比时记得调整 |
 
 完整字段见 `config.example.toml` 内注释。
 
@@ -224,9 +261,9 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
 **SQLite（`results/bench_<ts>.db`）**：
 
 - `stages`：每级配置与聚合结果（A1/A2/A3、放弃数、SLA/SLO、分位数、connect p50/p99、
-  RPS、输出 tok/s）。`kind='stage'` 为正式压力级，`kind='baseline'` 为 Phase 0
-  基线级（不参与容量判定）；`duration_s` 为配置时长、`actual_duration_s` 为实际时长
-  （含自适应延长与 drain 收尾）
+  RPS、输出 tok/s、水位状态 `watermark_state`）。`kind='stage'` 为正式压力级，
+  `kind='baseline'` 为 Phase 0 基线级（不参与容量判定）；`duration_s` 为配置时长、
+  `actual_duration_s` 为实际时长（含自适应延长与 drain 收尾）
 - `requests`：逐请求**特征**（计划/实际 token 数、connect/TTFT/TPOT/E2E、
   `latency_class` 分类、失败类型），**不保存原始请求与响应内容**。
   正式压力级的每条请求在落库时即回填 A1/A2/A3，可直接按类别检索
@@ -238,8 +275,8 @@ TTFT 与 prompt 长度强相关（prefill 计算量近似线性），TPOT 与已
   （`sent_at` 仍为真实发出时刻）
 
 **Markdown 报告（`results/report_<ts>.md`）**：结论（质量容量 + 3 个 9 口径 + SLO 口径
-+ 容量判定的补充说明）→ 基线剖析与生效门限（含按桶门限表"来源"列与质量退化率表）
-→ 方法 → 分级结果（含 SLO 判定列）→ 延迟分布（含 connect 开销提示）
++ 水位边界 + 容量判定的补充说明）→ 基线剖析与生效门限（含按桶门限表"来源"列与质量退化率表）
+→ 方法 → 分级结果（含 SLO 判定列与水位状态列）→ 延迟分布（含 connect 开销提示）
 → A1 构成 → A3 归因（TTFT/TPOT/双超标 + 按长度桶拆分）
 → 特征覆盖（含计划 vs 实测长度偏差告警）→ 建议 → 附录。
 

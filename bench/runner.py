@@ -77,9 +77,10 @@ class BenchmarkRunner:
             stats = await self._run_stage(index, concurrency)
             all_stats.append(stats)
             abort_txt = f" 放弃={stats.n_aborted}" if stats.n_aborted else ""
+            wm_txt = f" 水位={stats.watermark_state}" if self._cfg.watermark.enabled else ""
             self._log(
                 f"  -> 样本={stats.n_total} A1={stats.a1} A2={stats.a2} A3={stats.a3} "
-                f"SLA={stats.sla:.4f} SLO={stats.slo:.4f}{abort_txt} "
+                f"SLA={stats.sla:.4f} SLO={stats.slo:.4f}{abort_txt}{wm_txt} "
                 f"TTFT_p99={_fmt(stats.ttft_p99_ms)}ms TPOT_p99={_fmt(stats.tpot_p99_ms)}ms"
             )
         return all_stats
@@ -415,6 +416,7 @@ class BenchmarkRunner:
             warmup_s=stage_warmup,
             thresholds=self._thresholds,
             buckets=cfg.requests.length_buckets,
+            watermark=cfg.watermark,
         )
         # 放弃数按全量统计（含预热段）：预热段被放弃同样说明 drain 窗口不够
         stats.n_aborted = store.aborted_count(stage_id)

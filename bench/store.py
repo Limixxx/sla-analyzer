@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS stages (
     output_tps      REAL,
     prompt_tokens_avg   REAL,
     completion_tokens_avg REAL,
+    watermark_state TEXT,
+    watermark_reasons_json TEXT,
     fail_kinds_json TEXT
 );
 CREATE TABLE IF NOT EXISTS stage_buckets (
@@ -160,6 +162,7 @@ UPDATE stages SET
     connect_p50_ms=:connect_p50_ms, connect_p99_ms=:connect_p99_ms,
     rps=:rps, output_tps=:output_tps,
     prompt_tokens_avg=:prompt_tokens_avg, completion_tokens_avg=:completion_tokens_avg,
+    watermark_state=:watermark_state, watermark_reasons_json=:watermark_reasons_json,
     fail_kinds_json=:fail_kinds_json, ended_at=:ended_at
 WHERE id=:id
 """
@@ -203,6 +206,14 @@ class RecordStore:
         if "actual_duration_s" not in cols:
             self._conn.execute(
                 "ALTER TABLE stages ADD COLUMN actual_duration_s REAL"
+            )
+        if "watermark_state" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN watermark_state TEXT"
+            )
+        if "watermark_reasons_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN watermark_reasons_json TEXT"
             )
         # baseline 表在旧版本数据库中可能已存在（无 duration_actual_s 列）
         base_cols = {
@@ -270,6 +281,9 @@ class RecordStore:
         row["id"] = stage_id
         row["ended_at"] = time.time()
         row["fail_kinds_json"] = _json.dumps(stats.fail_kinds, ensure_ascii=False)
+        row["watermark_reasons_json"] = _json.dumps(
+            getattr(stats, "watermark_reasons", []), ensure_ascii=False
+        )
         self._conn.execute(_UPDATE_STAGE, row)
         # 按长度桶的拆分另存一张表，避免把字典塞进 stages
         if getattr(stats, "bucket_stats", None):

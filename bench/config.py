@@ -109,6 +109,24 @@ class RequestConfig:
 
 
 @dataclass
+class WatermarkConfig:
+    """水位判定参数（服务端水位的黑盒可观测投影，见 docs/05-watermark.md）。
+
+    推理水位分三层：软水位（BUSY，转入排队不拒绝）、硬水位（OVERLOAD，
+    直接拒绝）、SLA 水位（业务承诺）。压测工具是黑盒客户端，看不到
+    KV Cache / 批 slot / GPU 等服务端资源指标，因此这里判定的是
+    **可观测投影**：服务端排队 → TTFT 抬升、A3 增多；服务端拒绝 → A1 增多。
+    OR 逻辑（任一硬条件触发即 OVERLOAD），优先级 OVERLOAD > BUSY > NORMAL。
+    """
+
+    enabled: bool = True
+    soft_slo_violation_ratio: float = 0.05   # A3 占比 ≥ 此值 → 软水位 BUSY（排队预警）
+    hard_slo_violation_ratio: float = 0.50   # A3 占比 ≥ 此值 → 硬水位 OVERLOAD（质量崩塌）
+    hard_reject_ratio: float = 0.01          # A1 占比 ≥ 此值 → 硬水位 OVERLOAD（服务在拒绝）
+    soft_ttft_p99_ms: float = 0.0            # >0 时 TTFT p99 超此值也判 BUSY；0=关闭
+
+
+@dataclass
 class AnalysisConfig:
     """结论判定参数。"""
 
@@ -147,6 +165,7 @@ class Config:
     analysis: AnalysisConfig
     storage: StorageConfig
     report: ReportConfig
+    watermark: WatermarkConfig = field(default_factory=WatermarkConfig)
     source_path: str = ""
     # 本次运行中由 max_context_tokens 自动推导的字段名（如 ["prompt_token_targets"]）；
     # 空列表表示长度参数全部为显式配置。仅用于日志/报告标注，可审计。
@@ -185,6 +204,11 @@ class Config:
             "slo_target": self.analysis.slo_target,
             "min_samples_per_stage": self.analysis.min_samples_per_stage,
             "baseline_min_samples": self.analysis.baseline_min_samples,
+            "watermark_enabled": self.watermark.enabled,
+            "watermark_soft_slo_violation_ratio": self.watermark.soft_slo_violation_ratio,
+            "watermark_hard_slo_violation_ratio": self.watermark.hard_slo_violation_ratio,
+            "watermark_hard_reject_ratio": self.watermark.hard_reject_ratio,
+            "watermark_soft_ttft_p99_ms": self.watermark.soft_ttft_p99_ms,
             "prompt_token_targets": list(self.requests.prompt_token_targets),
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
@@ -316,6 +340,7 @@ def load_config(path: str) -> Config:
     ana_raw = raw.get("analysis", {})
     sto_raw = raw.get("storage", {})
     rep_raw = raw.get("report", {})
+    wm_raw = raw.get("watermark", {})
 
     service = ServiceConfig(
         base_url=_optional(svc_raw, "base_url", ServiceConfig.base_url, str, "service"),
@@ -392,6 +417,22 @@ def load_config(path: str) -> Config:
     storage = StorageConfig(db_path=str(sto_raw.get("db_path", "")))
     report = ReportConfig(output_path=str(rep_raw.get("output_path", "")))
 
+    watermark = WatermarkConfig(
+        enabled=_optional(wm_raw, "enabled", WatermarkConfig.enabled, bool, "watermark"),
+        soft_slo_violation_ratio=_optional(
+            wm_raw, "soft_slo_violation_ratio", WatermarkConfig.soft_slo_violation_ratio, float, "watermark"
+        ),
+        hard_slo_violation_ratio=_optional(
+            wm_raw, "hard_slo_violation_ratio", WatermarkConfig.hard_slo_violation_ratio, float, "watermark"
+        ),
+        hard_reject_ratio=_optional(
+            wm_raw, "hard_reject_ratio", WatermarkConfig.hard_reject_ratio, float, "watermark"
+        ),
+        soft_ttft_p99_ms=_optional(
+            wm_raw, "soft_ttft_p99_ms", WatermarkConfig.soft_ttft_p99_ms, float, "watermark"
+        ),
+    )
+
     cfg = Config(
         service=service,
         slo=slo,
@@ -400,6 +441,7 @@ def load_config(path: str) -> Config:
         analysis=analysis,
         storage=storage,
         report=report,
+        watermark=watermark,
         source_path=str(p),
     )
     _resolve_length_defaults(cfg)
@@ -478,6 +520,19 @@ def validate(cfg: Config) -> None:
         raise ConfigError("analysis.min_samples_per_stage 必须为正数")
     if a.baseline_min_samples <= 0:
         raise ConfigError("analysis.baseline_min_samples 必须为正数")
+
+    # --- 水位判定参数 ---
+    w = cfg.watermark
+    for name in ("soft_slo_violation_ratio", "hard_slo_violation_ratio", "hard_reject_ratio"):
+        if not 0.0 < getattr(w, name) <= 1.0:
+            raise ConfigError(f"watermark.{name} 必须在 (0, 1] 区间")
+    if w.soft_slo_violation_ratio >= w.hard_slo_violation_ratio:
+        raise ConfigError(
+            "watermark.soft_slo_violation_ratio 必须小于 hard_slo_violation_ratio"
+            "（软门限 ≥ 硬门限时 BUSY 永不可能出现，状态机退化为两档）"
+        )
+    if w.soft_ttft_p99_ms < 0:
+        raise ConfigError("watermark.soft_ttft_p99_ms 不能为负（0 表示关闭该判据）")
 
     # --- SLO 门限来源 ---
     if cfg.slo.target_mode not in ("absolute", "baseline_relative"):

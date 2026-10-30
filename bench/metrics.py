@@ -11,15 +11,19 @@
 派生指标：
 - SLA（可用性） = (A2 + A3) / 总数
 - SLO（质量）   = A2 / 总数
+
+水位判定（服务端水位的黑盒可观测投影，见 docs/05-watermark.md）：
+每级按 A1/A3 占比与 TTFT p99 判定 NORMAL / BUSY（软水位）/ OVERLOAD（硬水位），
+跨级汇总软/硬/SLA 三个水位边界。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .baseline import Thresholds, bucket_of, row_tokens
-from .config import AnalysisConfig, SloConfig
+from .config import AnalysisConfig, SloConfig, WatermarkConfig
 from .stats import mean, percentile
 
 
@@ -59,6 +63,57 @@ def classify(
         tpot_ok = tpot is None or tpot <= tpot_limit
 
     return "A2" if (ttft_ok and tpot_ok) else "A3"
+
+
+def classify_watermark(stats: "StageStats", wm: WatermarkConfig) -> Tuple[str, List[str]]:
+    """按黑盒可观测信号判定本级水位状态（watermark.md 三层语义的外部对偶）。
+
+    OR 逻辑、优先级 OVERLOAD > BUSY > NORMAL：
+    - OVERLOAD：A1 占比 ≥ hard_reject_ratio（服务在拒绝）或
+      A3 占比 ≥ hard_slo_violation_ratio（质量崩塌）；
+    - BUSY：A3 占比 ≥ soft_slo_violation_ratio，或（启用时）TTFT p99 ≥
+      soft_ttft_p99_ms——排队信号：不拒绝，但时延/质量已劣化；
+    - NORMAL：各项可观测指标均在软门限之内；
+    - unknown：无完成样本，无法判定（不参与边界发现）。
+
+    判定只用本级已有的聚合量，不改请求路径；--report-only 从旧库重建时
+    同样可判（幂等）。资源级水位（KV/slot/GPU）服务端不可见，不在此列。
+    """
+    if stats.n_total == 0:
+        return "unknown", []
+
+    a1_ratio = stats.a1 / stats.n_total
+    a3_ratio = stats.a3 / stats.n_total
+
+    hard: List[str] = []
+    if a1_ratio >= wm.hard_reject_ratio:
+        hard.append(
+            f"拒绝率 {a1_ratio:.2%} ≥ {wm.hard_reject_ratio:.2%}"
+            f"（A1={stats.a1}/{stats.n_total}）"
+        )
+    if a3_ratio >= wm.hard_slo_violation_ratio:
+        hard.append(
+            f"质量违约率 {a3_ratio:.2%} ≥ {wm.hard_slo_violation_ratio:.2%}"
+            f"（A3={stats.a3}/{stats.n_total}）"
+        )
+    if hard:
+        return "OVERLOAD", hard
+
+    soft: List[str] = []
+    if a3_ratio >= wm.soft_slo_violation_ratio:
+        soft.append(
+            f"质量违约率 {a3_ratio:.2%} ≥ {wm.soft_slo_violation_ratio:.2%}"
+            f"（A3={stats.a3}/{stats.n_total}）"
+        )
+    if (
+        wm.soft_ttft_p99_ms > 0
+        and stats.ttft_p99_ms is not None
+        and stats.ttft_p99_ms >= wm.soft_ttft_p99_ms
+    ):
+        soft.append(f"TTFT p99 {stats.ttft_p99_ms:.0f}ms ≥ {wm.soft_ttft_p99_ms:.0f}ms")
+    if soft:
+        return "BUSY", soft
+    return "NORMAL", ["各项可观测指标均在软门限之内"]
 
 
 @dataclass
@@ -111,6 +166,11 @@ class StageStats:
     sla_target: float = 0.0
     slo_target: float = 0.0
 
+    # 水位状态（服务端水位的黑盒可观测投影）：NORMAL / BUSY / OVERLOAD / unknown
+    watermark_state: str = "unknown"
+    # 触发原因（人类可读，随 watermark_reasons_json 落库）
+    watermark_reasons: List[str] = field(default_factory=list)
+
     # 按 prompt 长度桶的拆分（报告用；不入 stages 表，另存 stage_buckets）
     bucket_stats: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
@@ -142,6 +202,7 @@ def compute_stage_stats(
     warmup_s: float,
     thresholds: Optional[Thresholds] = None,
     buckets: Optional[Sequence[int]] = None,
+    watermark: Optional[WatermarkConfig] = None,
 ) -> StageStats:
     """由请求明细聚合一级压力位的统计量。"""
     stats = StageStats(
@@ -269,6 +330,10 @@ def compute_stage_stats(
     stats.completion_tokens_avg = mean(
         [r["completion_tokens"] for r in ok_rows if r.get("completion_tokens")]
     )
+    # 水位判定（黑盒可观测投影）：放在所有聚合量就绪之后
+    state, reasons = classify_watermark(stats, watermark or WatermarkConfig())
+    stats.watermark_state = state
+    stats.watermark_reasons = reasons
     return stats
 
 
@@ -451,4 +516,90 @@ def find_capacity(stages: Sequence[StageStats], analysis: AnalysisConfig) -> Cap
     finding.knee_concurrency = next(
         (s.concurrency for s in sufficient if s.sla < analysis.sla_target), None
     )
+    return finding
+
+
+@dataclass
+class WatermarkFinding:
+    """水位边界发现（跨级汇总）。
+
+    三个边界回答三个运维问题：
+    - soft_watermark_concurrency：首个 BUSY 级——排队预警线（Router 队列上限参考）；
+    - hard_watermark_concurrency：首个 OVERLOAD 级——熔断线（拒绝阈值参考）；
+    - sla_watermark_concurrency：= 质量容量——生产并发建议（与容量模型同一基准）。
+
+    注意这是"水位的可观测投影"：软水位投影略滞后于服务端软水位触达
+    （需积累足够 A3 样本才能分辨），报告中对滞后与未触达均有说明。
+    """
+
+    enabled: bool = True
+    soft_watermark_concurrency: Optional[int] = None
+    hard_watermark_concurrency: Optional[int] = None
+    sla_watermark_concurrency: Optional[int] = None
+    # concurrency -> state（含 unknown 的样本不足级），报告与审计用
+    states: Dict[int, str] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+
+def find_watermarks(
+    stages: Sequence[StageStats],
+    wm: WatermarkConfig,
+    capacity: Optional[CapacityFinding] = None,
+) -> WatermarkFinding:
+    """从分级水位状态中发现三个水位边界。
+
+    样本不足（n_total=0 → unknown）的级不参与边界发现（D10：不可信的
+    统计量比没有更危险）；连续前缀规则同样适用——软水位边界取"从低压到
+    高压第一个非 NORMAL 样本充足级"，避免个别级别抖动造成误报。
+    """
+    finding = WatermarkFinding(enabled=wm.enabled)
+    if not wm.enabled or not stages:
+        return finding
+
+    ordered = sorted(stages, key=lambda s: s.concurrency)
+    finding.states = {s.concurrency: s.watermark_state for s in ordered}
+
+    # 只让带完成样本的级参与边界发现
+    judged = [s for s in ordered if s.watermark_state != "unknown"]
+    unknown = [s for s in ordered if s.watermark_state == "unknown"]
+    if unknown:
+        finding.notes.append(
+            f"并发 {', '.join(str(s.concurrency) for s in unknown)} 无完成样本，"
+            "水位状态无法判定，不参与水位边界发现。"
+        )
+
+    finding.soft_watermark_concurrency = next(
+        (s.concurrency for s in judged if s.watermark_state in ("BUSY", "OVERLOAD")), None
+    )
+    finding.hard_watermark_concurrency = next(
+        (s.concurrency for s in judged if s.watermark_state == "OVERLOAD"), None
+    )
+    if capacity is not None:
+        finding.sla_watermark_concurrency = capacity.quality_capacity
+
+    if finding.soft_watermark_concurrency is None and judged:
+        finding.notes.append(
+            f"已测至最高并发 {judged[-1].concurrency} 仍未触达软水位投影"
+            "（全部 NORMAL）：只说明梯度上限内未观测到排队信号，"
+            "不代表服务没有软水位，如需确认应继续提高压力级。"
+        )
+    elif (
+        finding.soft_watermark_concurrency is not None
+        and finding.hard_watermark_concurrency is None
+    ):
+        finding.notes.append(
+            f"并发 {finding.soft_watermark_concurrency} 起进入软水位投影（BUSY），"
+            "但已测范围内未触达硬水位投影（无拒绝、无质量崩塌）："
+            "服务以排队消化压力，治理重点是扩容/调度而非熔断。"
+        )
+    if (
+        finding.hard_watermark_concurrency is not None
+        and finding.soft_watermark_concurrency is not None
+        and finding.hard_watermark_concurrency <= finding.soft_watermark_concurrency
+    ):
+        finding.notes.append(
+            f"硬水位投影（并发 {finding.hard_watermark_concurrency}）未晚于软水位投影"
+            f"（并发 {finding.soft_watermark_concurrency}）：压力跳过排队区直接触发拒绝，"
+            "Router 准入策略可能较激进。"
+        )
     return finding

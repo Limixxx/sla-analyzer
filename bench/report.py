@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from . import metrics
 from .baseline import BaselineResult, Thresholds, bucket_label
 from .config import Config
-from .metrics import CapacityFinding, StageStats
+from .metrics import CapacityFinding, StageStats, WatermarkFinding
 from .store import RecordStore
 
 
@@ -180,6 +180,7 @@ def build_conclusions(
     cfg: Config,
     stages: Sequence[StageStats],
     finding: CapacityFinding,
+    watermark: Optional[WatermarkFinding] = None,
 ) -> List[str]:
     """结论：以质量容量（SLA∧SLO 同时达标）为生产并发建议的唯一基准。
 
@@ -272,7 +273,31 @@ def build_conclusions(
             f"（SLO={_pct(finding.slo_at_slo_capacity)}）。"
         )
 
-    # ---- 4) 过载形态（按实际数据描述，不用模板硬编码） ----
+    # ---- 4) 水位边界（服务端水位的黑盒投影，见 docs/05-watermark.md） ----
+    if watermark is not None and watermark.enabled:
+        parts = []
+        if watermark.soft_watermark_concurrency is not None:
+            parts.append(
+                f"软水位投影（BUSY，排队预警线）自并发 "
+                f"{watermark.soft_watermark_concurrency} 起"
+            )
+        else:
+            parts.append("已测梯度内未触达软水位投影（BUSY）")
+        if watermark.hard_watermark_concurrency is not None:
+            parts.append(
+                f"硬水位投影（OVERLOAD，熔断线）自并发 "
+                f"{watermark.hard_watermark_concurrency} 起"
+            )
+        else:
+            parts.append("已测梯度内未触达硬水位投影（OVERLOAD，无拒绝/无质量崩塌）")
+        if watermark.sla_watermark_concurrency is not None:
+            parts.append(
+                f"SLA 水位（业务目标口径）= 并发 {watermark.sla_watermark_concurrency}"
+                "（与质量容量一致）"
+            )
+        lines.append("水位边界：" + "；".join(parts) + "。")
+
+    # ---- 5) 过载形态（按实际数据描述，不用模板硬编码） ----
     if finding.knee_concurrency is not None:
         knee = by_conc.get(finding.knee_concurrency)
         if knee is not None:
@@ -285,7 +310,7 @@ def build_conclusions(
                 f"（{_pct(knee.sla, 3)}），{shape}。"
             )
 
-    # ---- 5) 容量判定的补充说明 ----
+    # ---- 6) 容量判定的补充说明 ----
     # find_capacity 产生的 notes（未观测到拐点、SLA 重新达标抖动、零样本级别、
     # 样本充足级别无双达标等）必须出现在结论里：例如“SLA 容量 = 梯度最后一级”
     # 若不说明，读者会把它当成服务上限。
@@ -293,6 +318,10 @@ def build_conclusions(
     if finding.notes:
         lines.append("容量判定的补充说明：")
         for note in finding.notes:
+            lines.append(note)
+    if watermark is not None and watermark.enabled and watermark.notes:
+        lines.append("水位判定的补充说明：")
+        for note in watermark.notes:
             lines.append(note)
     return lines
 
@@ -391,6 +420,36 @@ def build_recommendations(
             "若需自动适配不同引擎/模型规模，可改用 slo.target_mode=baseline_relative。"
         )
 
+    # 水位运维建议：把水位边界翻译成 Router / 调度层可消费的配置
+    if cfg.watermark.enabled:
+        states = {s.concurrency: s.watermark_state for s in stages if s.watermark_state != "unknown"}
+        if states:
+            soft = next((c for c in sorted(states) if states[c] in ("BUSY", "OVERLOAD")), None)
+            hard = next((c for c in sorted(states) if states[c] == "OVERLOAD"), None)
+            if hard is not None:
+                hard_stage = next(s for s in stages if s.concurrency == hard)
+                shape = (
+                    f"出现拒绝（A1={hard_stage.a1}/{hard_stage.n_total}）"
+                    if hard_stage.a1 > 0
+                    else f"质量崩塌（A3={hard_stage.a3}/{hard_stage.n_total}）"
+                )
+                recs.append(
+                    f"水位运维建议：硬水位投影出现在并发 {hard}（{shape}），"
+                    "建议将 Router 拒绝阈值/熔断线设在该并发之下并预留余量；"
+                    "治理方向为扩容 PD 副本或提高准入并发，而非单纯调高拒绝阈值。"
+                )
+            elif soft is not None:
+                recs.append(
+                    f"水位运维建议：软水位投影出现在并发 {soft}（开始排队但未拒绝），"
+                    "建议将该并发作为 Router 排队预警线（触发告警/扩容评估），"
+                    "并把生产并发控制在质量容量之内以远离排队区。"
+                )
+            else:
+                recs.append(
+                    "水位运维建议：已测梯度内未触达任何水位投影，如需确认服务水位，"
+                    "应继续提高压力级或换用更陡的并发梯度。"
+                )
+
     recs.append(
         "口径提醒：本报告的 SLA/SLO 为全请求口径（含被 Router 拒绝的 A1）；"
         "若需“成功请求口径”的时延分布，可查询 DB 中 status='ok' 的明细。"
@@ -415,6 +474,7 @@ def render_report(
     started = meta.get("started_at", "unknown")
     lines: List[str] = []
     buckets = cfg.requests.length_buckets
+    wm_finding = metrics.find_watermarks(stages, cfg.watermark, finding)
 
     lines.append("# PD 分离推理服务质量（SLO/SLA）评估报告")
     lines.append("")
@@ -431,7 +491,7 @@ def render_report(
     # 结论 -----------------------------------------------------------------
     lines.append("## 一、结论")
     lines.append("")
-    for item in build_conclusions(cfg, stages, finding):
+    for item in build_conclusions(cfg, stages, finding, wm_finding):
         lines.append(f"- {item}")
     lines.append("")
 
@@ -450,13 +510,22 @@ def render_report(
     lines.append("5. SLA=(A2+A3)/总数，SLO=A2/总数；随并发递增绘制可用性/质量曲线，"
                  "分别定位 3 个 9（SLA 口径）与 SLO 口径对应的最高并发（连续前缀规则），"
                  "并以两者同时达标的**质量容量**作为生产并发建议基准。")
-    lines.append("6. 闭环低压级别的样本产出受单请求 E2E 限制，测量段样本不足时本级自动延长"
+    if cfg.watermark.enabled:
+        lines.append("6. 每级判定水位状态（服务端水位的黑盒投影，见 docs/05-watermark.md）："
+                     "NORMAL（无信号）/ BUSY（软水位投影：A3 占比或 TTFT p99 超软门限，"
+                     "服务在排队）/ OVERLOAD（硬水位投影：出现拒绝或 A3 占比超硬门限）；"
+                     "跨级汇总软/硬/SLA 三个水位边界，分别对应 Router 的排队预警线、"
+                     "熔断线与生产并发建议。")
+        adaptive_no, baseline_no = "7.", "8."
+    else:
+        adaptive_no, baseline_no = "6.", "7."
+    lines.append(f"{adaptive_no} 闭环低压级别的样本产出受单请求 E2E 限制，测量段样本不足时本级自动延长"
                  "（上限 load.max_stage_duration_s；基线阶段按“最短长度桶”判定，"
                  "因为门限是按桶解析的）；本级结束时仍在途的请求记为放弃"
                  "（aborted），不计入比率。")
     if cfg.slo.target_mode == "baseline_relative":
         lines.append(
-            "7. 判定门限来自第二节的低压基线（基线 p99 × 系数），与压力解耦："
+            f"{baseline_no} 判定门限来自第二节的低压基线（基线 p99 × 系数），与压力解耦："
             "同一把尺子贯穿全部压力级，因此跨级曲线可比；换引擎/模型只需重测基线。"
         )
     lines.append("")
@@ -464,9 +533,10 @@ def render_report(
     # 分级结果 -------------------------------------------------------------
     lines.append("## 四、分级压力测试结果")
     lines.append("")
+    wm_on = cfg.watermark.enabled
     rows = []
     for s in sorted(stages, key=lambda x: x.concurrency):
-        rows.append([
+        row = [
             str(s.concurrency),
             str(s.n_total),
             str(s.a1),
@@ -479,12 +549,15 @@ def render_report(
             "达标" if s.slo_met else "未达标",
             _num(s.rps, 1),
             _num(s.output_tps, 0),
-        ])
-    lines.append(_table(
-        ["并发", "样本数", "A1 失败", "A2 达标", "A3 不达标", "放弃",
-         "SLA", "SLA 判定", "SLO", "SLO 判定", "RPS", "输出 tok/s"],
-        rows,
-    ))
+        ]
+        if wm_on:
+            row.append(s.watermark_state)
+        rows.append(row)
+    headers = ["并发", "样本数", "A1 失败", "A2 达标", "A3 不达标", "放弃",
+               "SLA", "SLA 判定", "SLO", "SLO 判定", "RPS", "输出 tok/s"]
+    if wm_on:
+        headers.append("水位")
+    lines.append(_table(headers, rows))
     lines.append("")
     if any(s.n_total < cfg.analysis.min_samples_per_stage for s in stages):
         thin = [str(s.concurrency) for s in stages if s.n_total < cfg.analysis.min_samples_per_stage]
@@ -501,6 +574,41 @@ def render_report(
             "（status=aborted），不计入 SLA/SLO 分母；占比偏高时应增大 load.drain_timeout_s。"
         )
         lines.append("")
+
+    # 水位边界明细（服务端水位的黑盒投影） ----------------------------------
+    if wm_on:
+        lines.append("**水位边界**（服务端水位的可观测投影，判据见 `[watermark]` 配置；"
+                     "资源级水位如 KV Cache / 批 slot / GPU 属服务端内部指标，黑盒不可见，"
+                     "详见 docs/05-watermark.md）：")
+        lines.append("")
+        wrows = []
+        for s in sorted(stages, key=lambda x: x.concurrency):
+            if s.watermark_state == "unknown":
+                trigger = "无完成样本，无法判定"
+            elif s.watermark_state == "NORMAL":
+                trigger = "—"
+            else:
+                trigger = "；".join(s.watermark_reasons)
+            wrows.append([str(s.concurrency), s.watermark_state, trigger])
+        lines.append(_table(["并发", "水位状态", "触发原因"], wrows))
+        lines.append("")
+        parts = []
+        if wm_finding.soft_watermark_concurrency is not None:
+            parts.append(f"软水位投影（排队预警线）自并发 {wm_finding.soft_watermark_concurrency}")
+        else:
+            parts.append("已测梯度内未触达软水位投影")
+        if wm_finding.hard_watermark_concurrency is not None:
+            parts.append(f"硬水位投影（熔断线）自并发 {wm_finding.hard_watermark_concurrency}")
+        else:
+            parts.append("已测梯度内未触达硬水位投影")
+        if wm_finding.sla_watermark_concurrency is not None:
+            parts.append(f"SLA 水位（= 质量容量）为并发 {wm_finding.sla_watermark_concurrency}")
+        lines.append("> 边界汇总：" + "；".join(parts) + "。")
+        lines.append("")
+        for note in wm_finding.notes:
+            lines.append(f"> {note}")
+        if wm_finding.notes:
+            lines.append("")
 
     # 延迟分布 -------------------------------------------------------------
     lines.append("## 五、延迟分布（仅统计成功请求）")
@@ -659,12 +767,15 @@ def render_report(
     lines.append("")
     lines.append("## 附录 B：数据库字段说明")
     lines.append("")
-    lines.append("- `stages`：每级压力的配置与聚合结果（SLA/SLO/分位数/吞吐）。"
+    lines.append("- `stages`：每级压力的配置与聚合结果（SLA/SLO/分位数/吞吐/水位状态）。"
                  "`kind='stage'` 为正式压力级，`kind='baseline'` 为 Phase 0 基线级（不参与容量判定）。")
     lines.append("- `requests`：逐请求特征（长度、TTFT/TPOT/E2E、分类、失败类型），"
                  "**不含原始请求与响应内容**。")
     lines.append("- `stage_buckets`：每级按 prompt 长度桶的拆分（A2/A3/超标归因/该桶生效门限）。")
     lines.append("- `baseline`：Phase 0 各长度桶的时延分位数，是 baseline_relative 门限的来源。")
+    lines.append("- `stages.watermark_state` / `watermark_reasons_json`：本级水位状态"
+                 "（NORMAL/BUSY/OVERLOAD/unknown）与触发原因——服务端水位的黑盒投影，"
+                 "见 docs/05-watermark.md；`--report-only` 会按当前 `[watermark]` 配置重算。")
     lines.append("- `is_warmup=1` 的为预热数据，统计时排除。")
     lines.append("- `status='aborted'` 的为本级结束时仍在途、超过 drain 上限被放弃的请求，"
                  "不计入 SLA/SLO 分母。")
