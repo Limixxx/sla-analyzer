@@ -1,0 +1,50 @@
+# 自测配置：配合 mock_server.py 在本地验证 benchmark 工具全链路。
+# 用法：
+#   python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --soft-capacity 8 --hard-capacity 12
+#   python bench.py --config config.mock-demo.toml
+
+[service]
+base_url = "http://127.0.0.1:8123"
+api_key = ""
+path = "/v1/chat/completions"
+model = "mock-model"
+timeout_s = 120.0
+connect_timeout_s = 5.0
+verify_tls = false
+
+[slo]
+ttft_target_s = 1.0
+tpot_target_ms = 40.0
+min_completion_tokens = 2
+
+[load]
+mode = "closed"
+concurrency_steps = [1, 2, 4, 8, 16, 24, 32]
+stage_duration_s = 12.0
+warmup_s = 3.0
+think_time_s = 0.0
+max_requests_per_stage = 800
+drain_timeout_s = 20.0
+
+[requests]
+prompt_token_targets = [256, 1024]
+prompt_weights = [0.5, 0.5]
+max_context_tokens = 8192
+output_token_choices = [32, 64]
+output_weights = [0.6, 0.4]
+temperature = 0.7
+stream = true
+unique_prefix = true
+seed = 20241030
+chars_per_token = 3.5
+
+[analysis]
+sla_target = 0.999
+slo_target = 0.9
+min_samples_per_stage = 30
+
+[storage]
+db_path = "results/selfcheck.db"
+
+[report]
+output_path = "results/selfcheck_report.md"

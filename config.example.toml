@@ -1,0 +1,78 @@
+# PD 分离推理 QoS 压测配置示例
+# 复制为 config.toml 后按实际环境修改。所有时长单位均为秒。
+
+[service]
+# Router（前端入口）地址；Grove 模式下通常是 router serving Service 的 DNS 或 NodePort
+base_url = "http://127.0.0.1:8000"
+# 如需鉴权
+api_key = ""
+# OpenAI 兼容端点；纯 completions 端点也可（工具自动适配 prompt/messages 形态）
+path = "/v1/chat/completions"
+model = "default"
+# 单请求整体超时：分钟级请求必须显著大于最长合法请求时长，否则误判为超时失败
+timeout_s = 600.0
+connect_timeout_s = 10.0
+verify_tls = false
+# extra_headers = { "X-Tenant-Id" = "demo" }
+
+[slo]
+# TTFT 目标（首 token 时间），秒
+ttft_target_s = 2.0
+# TPOT 目标（每输出 token 时间），毫秒
+tpot_target_ms = 50.0
+# 输出 token 少于此值时 TPOT 不参与判定（避免极短输出的统计噪声）
+min_completion_tokens = 2
+
+[load]
+# closed = 闭环固定并发（推荐，用于探测 Router 缓冲/拒绝边界）
+# open   = 开环固定 RPS（需配置 target_rps）
+mode = "closed"
+# 递增并发梯度：由低压到高压逐级施压，建议覆盖预期拐点两侧
+concurrency_steps = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
+# 每级稳压时长（秒）；样本不足时调大
+stage_duration_s = 60.0
+# 每级预热时长（秒），预热数据不计入统计
+warmup_s = 10.0
+# 闭环模式下每次请求前的思考时间（秒）
+think_time_s = 0.0
+# 每级请求数上限（防止高压级样本爆炸）；预热段单独计数
+max_requests_per_stage = 5000
+max_warmup_requests_per_stage = 5000
+# 到点后在途请求的最大等待（秒）
+drain_timeout_s = 60.0
+# 仅 open 模式生效
+target_rps = 0.0
+max_inflight = 4096
+
+[requests]
+# prompt 长度目标（token）分布，需与 max_context_tokens 匹配
+prompt_token_targets = [512, 2048, 8192]
+prompt_weights = [0.2, 0.5, 0.3]
+# 服务支持的上下文上限（prompt + output 不得超过）；从服务文档或 /v1/models 获取
+max_context_tokens = 32768
+# 输出长度（token）分布；TPOT 统计需要足够的输出 token
+output_token_choices = [128, 256]
+output_weights = [0.7, 0.3]
+temperature = 0.7
+stream = true
+# 每请求附加唯一前缀，规避前缀缓存对 TTFT 的“美化”
+unique_prefix = true
+seed = 20241030
+# 无 tokenizer 时的字符/token 估算比（中英文混合约 3.5；真实值以 usage 为准并可在报告中复盘）
+chars_per_token = 3.5
+
+[analysis]
+# SLA 目标：A2+A3 占比；0.999 即 3 个 9
+sla_target = 0.999
+# SLO 目标：A2 占比
+slo_target = 0.95
+# 样本少于此值的压力级不参与容量判定
+min_samples_per_stage = 100
+
+[storage]
+# 留空则自动生成 results/bench_<时间戳>.db
+db_path = ""
+
+[report]
+# 留空则自动生成 results/report_<时间戳>.md
+output_path = ""
