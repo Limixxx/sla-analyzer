@@ -1,7 +1,8 @@
 # 07 概要设计：部件、时序与关键量的确定
 
 > 回答的问题：**这个工具由哪些部件组成？一次运行按什么顺序发生？
-> Phase 0 低压基线是如何分桶、如何确定基线的？SLA/SLO 的值是如何被确定出来的？**
+> Phase 0 低压基线是如何分桶、如何确定基线的？请求特征是如何被采样的？
+> SLA/SLO 的值与水位的判定是如何被确定出来的？**
 > 实现：整个 `bench/` 包 + `bench.py` 入口；本文所有论断均可在代码中核对。
 
 01–06 是**方法论**（回答"为什么这样设计"），本文是**设计**（回答"由什么组成、
@@ -164,6 +165,34 @@ length_buckets = [1024, 4096]
 **不会收到样本**，按桶延长时会被排除（`runner.py::reachable`），
 避免无样本桶把基线阶段拖到上限。
 
+**采样是逐请求独立的，不存在"短 runner / 长 runner"**：全 run 只构造一个
+`PromptFactory`（内含一个 `random.Random(cfg.seed)`），被所有 worker 共享；
+每个 worker 每轮循环现抽一次规格再发请求（`prompts.py::sample_spec`）：
+
+```
+worker 数：closed 模式 = 本级并发数（每 worker 串行"发→等→再发"）
+          open   模式 = 1 个发射器，按 target_rps 定时发
+
+每轮循环（任一 worker）：
+    slot   = take_slot()             # 额度控制：预热/测量/延长/上限，见 §7.3
+    spec   = factory.sample_spec()   # ← 每次调用都重新抽，worker 不绑定长度档
+    prompt = factory.build(spec)     # 头部 seq + nonce，规避上游前缀缓存命中
+
+sample_spec：两次相互独立的加权抽样（不是配对表）
+    prompt_tokens_target = weighted_choice(prompt_token_targets, prompt_weights)  # [512,2048,8192]×[.2,.5,.3]
+    max_tokens           = weighted_choice(output_token_choices,  output_weights) # [128,256]×[.7,.3]
+    → 二维组合是独立乘积：512/256 与 8192/128 都会出现
+```
+
+两条必然后果（读报告和改配置时都要记住）：
+
+- **比例靠大数定律收敛，不是按桶配额轮转**。所以单级的各桶样本数是随机的，
+  权重最小的桶天然最少——这正是基线阶段最短桶（0.2 权重）成为薄桶、进而
+  触发 absolute 回退的直接原因（§7.4.2 规则 2）。
+- **可复现的是"分布"而非"内容"**：抽样序列共享同一个 RNG，同 seed 且请求
+  发出顺序相同才复现出同样的 prompt 文本；worker 交错顺序变了，文本就变，
+  但长度档分布不变。
+
 ### 7.4.2 基线怎么确定
 
 **执行参数**（`[load]` 配置段）：
@@ -188,6 +217,25 @@ length_buckets = [1024, 4096]
    延长在日志显式提示。按权重反推的总量需求 = `floor / min_weight`
    （默认 30 / 0.2 = 150 个总样本）——这就是默认 30s 在多数部署下会被
    延长、而日志会给出"还差多少样本/约需多少秒/建议并发提到多少"的原因。
+
+   **延长判据与回退判据不同源，必须分开核对**（否则会出现"延长已停止但
+   仍有桶回退"的困惑）：
+
+   ```
+   延长判据（runner，决定本级要不要继续跑）：
+       min( 已发出请求数[桶]  for 权重>0 的桶 ) < baseline_min_samples
+       分桶键 = spec.prompt_tokens_target（计划长度）；发出即计数（含随后失败与在途的）
+
+   回退判据（baseline.py，决定该桶能不能用）：
+       n_ok[桶] ≥ baseline_min_samples  且  TTFT_p99[桶] 非空  且  TPOT_p99[桶] 非空
+       分桶键 = row_tokens(row)（实际 usage 的 prompt_tokens，缺失才退计划长度）
+       只计 status == "ok" 的请求
+   ```
+
+   分桶键一个是"计划"一个是"实际"，而实际长度普遍短于计划（真实 token 数
+   由服务端 tokenizer 决定，工具侧只按 `chars_per_token` 估算），请求会
+   向更低的桶漂移——最短桶因此更难达标。
+
 3. **被污染要喊出来**。基线阶段出现任何失败请求（`total_a1 > 0`）说明
    "低压"并不低压：p99 虚高、门限虚松。报告与日志明确提示降低
    `baseline_concurrency` 或排查可用性，而不是把污染基线当好尺子。
@@ -225,7 +273,8 @@ target_mode=absolute ──► 所有桶统一 ttft_target_s×1000 / tpot_target
                         （样本量不参与，契约口径）
 
 target_mode=baseline_relative ──► for 每个桶 i：
-        基线桶 i 可用（n_ok ≥ baseline_min_samples 且 p99 齐全）？
+        usable = 基线桶 i 的 n_ok ≥ baseline_min_samples
+                 且 TTFT_p99[i] 非空 且 TPOT_p99[i] 非空       # 联合门槛，见下
           是 ──► 门限[i] = 基线 p99[i] × 系数（TTFT×ttft_factor，TPOT×tpot_factor）
           否 ──► 门限[i] = absolute 配置值，记入 fallback_buckets 并标注
         基线整体缺失 ──► 整体回退 absolute + notes
@@ -233,6 +282,17 @@ target_mode=baseline_relative ──► for 每个桶 i：
 
 设计细节：
 
+- **回退是"按桶"而不是"全局"**：薄桶用自己的绝对值尺，其余桶仍走基线口径；
+  一次运行里两种口径的桶并存是正常状态，报告第二节"来源"列会逐桶标明
+  `基线×系数` 还是 `回退 absolute`。
+- **联合门槛**：`usable` 要求 TTFT 与 TPOT 两个 p99 **同时**齐全，任一侧缺失
+  （该侧样本序列为空 → `percentile` 返回 None）则该桶**两把尺一起**回退，
+  不做"一半可信一半不可信"的混搭判定。反过来的宽松点也要知道：样本量门槛
+  看的是 `n_ok`（桶内全部成功请求），而 TPOT 序列还额外被
+  `completion_tokens ≥ min_completion_tokens` 过滤过，因此理论上存在
+  "`n_ok` 已达 30 但 TPOT 有效样本极少、p99 仍算可用"的情形——审计薄桶时
+  应同时看 `baseline.tpot_p99_ms` 是否落在可信区间，必要时提高
+  `min_completion_tokens` 或加长基线。
 - **min_samples 默认值按模式区分**：`baseline_relative` 用
   `analysis.baseline_min_samples`（30），`absolute` 用
   `min_samples_per_stage`（60，虽然 absolute 根本不看样本量）。
@@ -244,14 +304,31 @@ target_mode=baseline_relative ──► for 每个桶 i：
 - **`classify` 按桶取门限**：单请求分类时先 `bucket_of(row_tokens)` 再取
   该桶门限；桶缺失（理论上不会发生）退回全局 absolute 保底。
 
-## 7.6 SLA/SLO 的值如何确定：三层递进
+## 7.6 SLA/SLO 的值如何确定：三层递进 + 水位公式
 
 SLA/SLO 不是配置里"设"出来的，是**测出来**的（[01](01-metrics-slo-sla.md)
-§1.7）。值的确定分三层，每层的输入输出都是明确的数据结构：
+§1.7）。值的确定分三层（§7.6.1–§7.6.3），水位投影用与拐点同源的判据单独判定
+（§7.6.4）；每层的输入输出都是明确的数据结构：
 
 ### 7.6.1 第一层：请求级分类（classify）
 
 每条成功请求按**所在长度桶的门限**打标：
+
+```
+classify(row):
+    if row.status != "ok":  return A1                 # 失败只看 status，不与任何门限比较
+
+    idx        = bucket_of(row_tokens(row), buckets)   # 分桶键：实际 prompt_tokens，缺失才退计划长度
+    ttft_limit = thresholds.ttft[idx] ?? slo.ttft_target_s × 1000    # 桶门限缺失 → absolute 保底
+    tpot_limit = thresholds.tpot[idx] ?? slo.tpot_target_ms
+
+    ttft_ok = (row.ttft is not None) and (row.ttft ≤ ttft_limit)   # TTFT 缺失 → 判不达标
+    if   row.completion_tokens < min_completion_tokens:  tpot_ok = True   # 短输出免检（分母太小、噪声极大）
+    else:                                                tpot_ok = (row.tpot is None or row.tpot ≤ tpot_limit)
+                                                         # 无 TPOT 时序（非流式）也不判超标
+
+    return A2 if (ttft_ok and tpot_ok) else A3
+```
 
 | 类别 | 判据 |
 | --- | --- |
@@ -259,29 +336,60 @@ SLA/SLO 不是配置里"设"出来的，是**测出来**的（[01](01-metrics-sl
 | A2 | TTFT ≤ 桶门限 **且** TPOT ≤ 桶门限 |
 | A3 | 成功但 TTFT 或 TPOT 超门限 |
 
-短输出免检：`completion_tokens < min_completion_tokens`（默认 2）时
-TPOT 不参与判定（分母太小、噪声极大）。基线阶段不分类（§7.4.2 规则 1）。
+四个容易读错的点：
+
+- **不是统一一把尺**：每个桶有自己的一对门限（§7.5），全平台统一的只有
+  "系数"（×3.0 / ×2.0）和模式。同一次运行里各桶达标线可以差一个数量级——
+  本次实测 TTFT 线：≤1024 桶 2000ms（该桶薄，回退 absolute）、
+  1025-4096 桶 581ms（基线 p99 × 3）、>4096 桶 2296ms（基线 p99 × 3）。
+- **分桶键是实际长度**（服务端 usage），所以"计划 2048、实测 900"的请求
+  会去比 ≤1024 桶那把更松的尺。这既符合语义（prefill 真实算力按实际
+  token 计），也意味着 `chars_per_token` 估偏会改变判定归属，报告第八节
+  的长度偏差（本次 -14.3%）要连同这一条一起读。
+- **A3 的两条豁免**：短输出免检 TPOT、缺 TPOT 时序免检 TPOT——两者都只会
+  让 A2 变多、不会误伤成 A3；反向的严格点是 TTFT 为 None 时直接判不达标。
+- **分类结果的写入时机**：正式级在请求结束时回填 `latency_class` 落库，
+  基线阶段刻意不回填（§7.4.2 规则 1）；聚合时优先读已落库标签，缺省才
+  现场重算，因此 `--report-only` 与实时跑同一结论（C3）。
 
 ### 7.6.2 第二层：级汇总（compute_stage_stats）
 
 每级（或 Phase 0）汇总出统计量，**N 不含 aborted**（存活者偏差控制，[04](04-measurement-validity.md) §4.1）：
 
 ```
-SLA（可用性） = (A2 + A3) / N        "接得住"
-SLO（质量）   =  A2      / N         "接得好"
+rows    = 本级请求明细（取数时已排除 is_warmup=1）
+aborted = [r for r in rows if r.status == "aborted"]     # 本级结束仍在途、drain 超时被放弃
+rows    = rows − aborted
+n_total = len(rows)                                      # ← SLA/SLO 与水位唯一的分母
+
+A1/A2/A3 = 逐条 classify(rows) 计数                       # 优先读已落库的 latency_class
+
+SLO = A2 / n_total                       # 只有"成功且双达标"才算质量
+SLA = (A2 + A3) / n_total ≡ 1 − A1 / n_total   # 成功即算可用，只有 A1 拉低它
 ```
 
-同时产出：TTFT/TPOT 的 p50/p90/p95/p99、E2E 与 connect 的 p50/p99、
-RPS/output_tps、A1 的 `fail_kinds` 直方图（拒绝族/超时族拆分的数据源）、
-按桶拆分（`stage_buckets`）、水位状态。这一层全部落库，是 report-only
-重建的唯一数据源。
+三条读数纪律：
+
+- **aborted 不进任何比率与分位数**，单列 `n_aborted`。它不是失败也不是成功，
+  计入任一侧都会系统性失真（被放弃的恰是最慢的一批）。
+- **A1=0 时 SLA 恒为 1**，与 SLO 归零并存不矛盾：闭环施压下一级请求数有上限，
+  排队（A3）而非拒绝（A1）消化压力时，"可用性 100% + 质量 0%"是正常读数，
+  此时容量结论只能以 SLO 为准。
+- **分位数与吞吐的分母口径不同于 SLA/SLO**：TTFT/TPOT/E2E/connect 的
+  p50~p99 只在 `status == "ok"` 的行上算；RPS 与输出 tok/s 用请求自身墙钟
+  窗口 `[min(sent_at), max(sent_at + e2e)]` 做分母（含 drain 尾巴），不是
+  名义稳压窗口——否则跨窗口完成的请求会让吞吐被低估。
+
+同时产出：A1 的 `fail_kinds` 直方图（拒绝族/超时族拆分的数据源）、按桶拆分
+（`stage_buckets`：桶内 A1/A2/A3、超标侧、桶 p99、生效门限快照）、水位状态
+（§7.6.4）。这一层全部落库，是 report-only 重建的唯一数据源。
 
 ### 7.6.3 第三层：结论级——人工价值目标 vs 实测边界
 
 | | 输入（人工） | 输出（实测） | 代码 |
 | --- | --- | --- | --- |
 | 价值目标 | `sla_target`（几个 9，默认 0.999）、`slo_target`（达标率，默认 0.95）、`ttft_factor`/`tpot_factor`（退化预算 3×/2×） | — | `config.py` |
-| 实测边界 | 判据参数（水位软/硬门限：A3≥5%、A1≥1%、A3≥50%） | **A3 拐点 = 质量/SLO 边界**（首个 BUSY 级）、**A1 拐点 = 可用性/SLA 边界**（首个 OVERLOAD 级） | `find_service_levels` |
+| 实测边界 | 判据参数（水位软/硬门限：A3≥5%、A1≥1%、A3≥50%，公式见 §7.6.4） | **A3 拐点 = 质量/SLO 边界**（首个 BUSY 级）、**A1 拐点 = 可用性/SLA 边界**（首个 OVERLOAD 级） | `find_service_levels` |
 | 目标口径容量 | 同上价值目标 | 3 个 9 容量（SLA 达标前缀）、SLO 容量、**质量容量**（双达标前缀，生产建议唯一基准） | `find_capacity` |
 
 三条提炼规则（与容量/水位边界共用）：
@@ -304,6 +412,52 @@ RPS/output_tps、A1 的 `fail_kinds` 直方图（拒绝族/超时族拆分的数
 拐点（退化起点）严于目标容量（价值目标达标前缀）：质量容量 ≤ 拐点。
 报告先陈述实测拐点（"退化从哪里开始"），再给目标口径容量
 （"价值目标内推荐跑多少"），两者不混写。
+
+### 7.6.4 水位判定：级内公式与跨级三边界
+
+水位是服务端内部水位的**可观测投影**（[05](05-watermark.md)）：黑盒客户端看
+不到 KV Cache / 批 slot / GPU，只能用"是否出现失败、是否出现不达标"反推
+服务端在排队还是在拒绝。**级内判定**（`classify_watermark`，只用本级聚合量）：
+
+```
+a1_ratio = a1 / n_total
+a3_ratio = a3 / n_total
+
+若 n_total == 0                                                -> unknown（不参与边界发现）
+若 a1_ratio ≥ hard_reject_ratio(0.01)
+   或  a3_ratio ≥ hard_slo_violation_ratio(0.50)               -> OVERLOAD   ← 先判，优先级最高
+若 a3_ratio ≥ soft_slo_violation_ratio(0.05)
+   或  (soft_ttft_p99_ms > 0 且 TTFT_p99 ≥ soft_ttft_p99_ms)   -> BUSY       ← 软门限（排队预警）
+否则                                                            -> NORMAL
+```
+
+- **OR 逻辑 + 优先级**，不是打分制：任一硬条件命中即 OVERLOAD，硬条件全否
+  才看软条件。多个条件同时命中时**触发原因逐条累积**，报告的"触发原因"列
+  因而可能有两行——这比只留一条更可解释（运维能分清是质量崩塌还是出现拒绝）。
+- `soft_ttft_p99_ms` 默认 0 = **该条关闭**。因为"TTFT 绝对值多少算排队"与
+  引擎/模型强相关，没有跨部署的合理默认；要用就得按本部署显式设定。默认
+  配置下 BUSY 只由 A3 占比驱动。
+- **A1 触发硬水位时再做家族归因**（`split_fail_kinds`）：超时族 > 拒绝族 ⇒
+  排队型过载（Router 疑似无限队列，过载只投影为客户端超时）；拒绝族 > 超时族
+  ⇒ 拒绝型过载（429/5xx 明确回绝）。归因不改变水位状态，只改变治理建议方向
+  （扩容/调度 vs 熔断/准入）。
+- 分母与 SLA/SLO 同一个 `n_total`（§7.6.2），因此水位状态与本级 SLO 读数
+  必然自洽：`a3_ratio = 1 − SLO`（在 A1=0 时严格成立）。
+
+**跨级三边界**（`find_watermarks`，与 §7.6.3 的拐点判据同源）：
+
+```
+judged = 按并发升序、剔除 unknown（无完成样本）后的级
+
+软水位边界（排队预警线） = judged 中首个 state ∈ {BUSY, OVERLOAD} 的并发
+硬水位边界（熔断线）     = judged 中首个 state == OVERLOAD 的并发
+SLA 水位（生产并发建议） = find_capacity 的 quality_capacity      # 直接引用，不另算
+```
+
+取"首个"而非"最高"同样是连续前缀思路：个别级别抖动不应被当成边界。两条
+反常形态会由 notes 明确喊出：硬边界不晚于软边界（压力跳过排队区直接触发
+拒绝，提示准入策略激进或无限队列）；全程 NORMAL 未触达软边界（只说明梯度
+上限内没观测到排队信号，不等于服务没有软水位）。
 
 ## 7.7 数据模型
 
@@ -369,6 +523,7 @@ SQLite 单文件，五张表（`store.py::SCHEMA`）：
 | 设计概念 | 位置 |
 | --- | --- |
 | 分桶映射/标签 | `bench/baseline.py::bucket_of / bucket_label / bucket_count` |
+| 请求特征采样（逐请求独立加权，§7.4.1） | `bench/prompts.py::PromptFactory.sample_spec / build` |
 | Phase 0 编排（按桶延长、量化提示） | `bench/runner.py::_run_baseline / _baseline_shortfall_hints` |
 | 基线统计（只统计不判定） | `bench/baseline.py::compute_baseline` |
 | 门限解析（两模式 + 回退） | `bench/baseline.py::resolve_thresholds` |
@@ -376,6 +531,7 @@ SQLite 单文件，五张表（`store.py::SCHEMA`）：
 | 级汇总 | `bench/metrics.py::compute_stage_stats` |
 | 实测服务等级（两个拐点） | `bench/metrics.py::find_service_levels` |
 | 目标口径容量（连续前缀） | `bench/metrics.py::find_capacity` |
+| 级内水位判定（§7.6.4 公式） | `bench/metrics.py::classify_watermark` |
 | 水位边界 | `bench/metrics.py::find_watermarks` |
 | A1 家族拆分 | `bench/metrics.py::split_fail_kinds` |
 | 压力编排（预热/延长/drain） | `bench/runner.py::_run_stage` |
