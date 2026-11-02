@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -11,7 +12,13 @@ from . import metrics
 from . import qos as qos_mod
 from .baseline import BaselineResult, Thresholds, bucket_label, bucket_of
 from .config import Config
-from .metrics import CapacityFinding, StageStats, WatermarkFinding, split_fail_kinds
+from .metrics import (
+    CapacityFinding,
+    ServiceLevelFinding,
+    StageStats,
+    WatermarkFinding,
+    split_fail_kinds,
+)
 from .qos import (
     BoundaryScan,
     MixPoint,
@@ -38,6 +45,17 @@ def _ms(value: Optional[float]) -> str:
 
 def _num(value: Optional[float], digits: int = 2) -> str:
     return f"{value:.{digits}f}" if value is not None else "n/a"
+
+
+def _nines_suffix(target: float) -> str:
+    """0.999 → "（3 个 9）"；不是整数个 9 时返回空串（不硬凑）。"""
+    if target >= 1.0:
+        return ""
+    nines = -math.log10(1.0 - target)
+    nearest = round(nines)
+    if nearest >= 1 and abs(nines - nearest) < 0.05:
+        return f"（{nearest} 个 9）"
+    return ""
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -489,11 +507,17 @@ def build_conclusions(
     finding: CapacityFinding,
     watermark: Optional[WatermarkFinding] = None,
     qos: Optional[QoSResult] = None,
+    service_levels: Optional[ServiceLevelFinding] = None,
 ) -> List[str]:
     """结论：以质量容量（SLA∧SLO 同时达标）为生产并发建议的唯一基准。
 
     SLA 达标仅表示"接得住"，SLO 达标才表示"接得好"；SLA 100% 而 SLO 归零
     意味着服务全靠排队消化压力，该容量不具备生产意义。
+
+    service_levels（实测服务等级）先于目标口径结论陈述：SLA/SLO 是本次
+    压测实测出来的两个拐点（A3 拐点 = 质量/SLO 边界，A1 拐点 = 可用性/
+    SLA 边界），人工设定的 sla_target/slo_target 只是筛选达标前缀的价值
+    目标，不是门限的来源（docs/01 §1.7）。
     """
     lines: List[str] = []
     sla_target = cfg.analysis.sla_target
@@ -515,6 +539,62 @@ def build_conclusions(
             msg += f"（共放弃 {total_aborted} 个在途请求）"
         msg += "请增大 load.drain_timeout_s / load.stage_duration_s 后复测。"
         return [msg]
+
+    # ---- 0) 实测服务等级：两个拐点由数据产出，不是人工设定值 ----
+    # SLA/SLO 的口径定义（docs/01 §1.2）决定了拐点的归属：
+    #   SLO = A2/N 由 A3 驱动 ⇒ A3 拐点即质量边界；
+    #   SLA = (A2+A3)/N 由 A1 驱动 ⇒ A1 拐点即可用性边界。
+    # 人工只提供价值目标（几个 9 的可用性 + 质量退化预算），边界值全部实测。
+    if service_levels is not None:
+        sl = service_levels
+        if cfg.slo.target_mode == "baseline_relative":
+            yardstick = "判定尺子由低压基线实测（p99 × 系数），拐点即相对基线的退化起点"
+        else:
+            yardstick = "判定尺子为人工设定的业务契约门限，拐点即契约违约起点"
+        if sl.quality_boundary is not None:
+            qb = by_conc.get(sl.quality_boundary)
+            if qb is not None and qb.a1 > 0:
+                # SLO = A2/N 同时被 A3 与 A1 拉低：失败先于慢化出现时，质量边界
+                # 与可用性边界重合，驱动因素是失败而非排队——如实说明，不套模板。
+                detail = (
+                    f"（该级失败 A1={qb.a1}/{qb.n_total} 直接拉低 SLO 至 "
+                    f"{_pct(qb.slo, 2)}，A3={qb.a3}）：质量崩塌由失败驱动"
+                    "（拒绝或客户端超时），而非排队慢化，与可用性边界重合"
+                )
+                closing = "该并发之内请求在尺子内完成且不失败，之上质量不再保持。"
+            elif qb is not None:
+                detail = (
+                    f"（该级 A3={qb.a3}/{qb.n_total}，SLO 降至 {_pct(qb.slo, 2)}）"
+                )
+                closing = "该并发之内服务保持判定尺子内的质量，之上质量系统性劣化。"
+            else:
+                detail = ""
+                closing = ""
+            lines.append(
+                f"**实测质量边界（SLO 边界 / 质量拐点）= 并发 {sl.quality_boundary}**"
+                f"{detail}：{closing}"
+            )
+        if sl.availability_boundary is not None:
+            ab = by_conc.get(sl.availability_boundary)
+            detail = (
+                f"（该级 A1={ab.a1}/{ab.n_total}，SLA={_pct(ab.sla, 3)}）"
+                if ab is not None else ""
+            )
+            lines.append(
+                f"**实测可用性边界（SLA 边界 / A1 拐点）= 并发 {sl.availability_boundary}**"
+                f"{detail}：该并发之内服务接得住，之上开始出现失败。"
+            )
+        lines.extend(sl.notes)
+        if sl.quality_boundary is not None or sl.availability_boundary is not None:
+            tail = (
+                f"下方质量容量结论（并发 {sl.quality_capacity}）是人工价值目标口径的"
+                "保守子集（目标门限严于拐点门限），推荐生产并发以它为准。"
+                if sl.quality_capacity is not None
+                else "人工价值目标口径的容量结论见下方。"
+            )
+            lines.append(
+                "两个拐点回答“退化从哪里开始”；" + tail + yardstick + "。"
+            )
 
     # ---- 1) 质量容量 / 生产并发建议 ----
     q = finding.quality_capacity
@@ -860,6 +940,8 @@ def render_report(
     lines: List[str] = []
     buckets = cfg.requests.length_buckets
     wm_finding = metrics.find_watermarks(stages, cfg.watermark, finding)
+    # 实测服务等级（A3/A1 拐点）：SLA/SLO 由实测产出，人工目标只作约束
+    sl_finding = metrics.find_service_levels(stages, finding, cfg.watermark)
     # 预测模型预计算（mix / 分级预测 / 边界细扫）必须先于结论：结论区引用 qos.scan
     _prepare_qos(cfg, store, stages, qos)
 
@@ -869,8 +951,9 @@ def render_report(
     lines.append(f"- 被测服务：`{cfg.service.base_url}`（`{cfg.service.path}`，模型 `{cfg.service.model}`）")
     lines.extend(_threshold_headline(cfg, thresholds, buckets))
     lines.append(
-        f"- 目标：SLA（A2+A3 占比）≥ {cfg.analysis.sla_target:.1%}（3 个 9），"
-        f"SLO（A2 占比）≥ {cfg.analysis.slo_target:.1%}"
+        f"- 人工价值目标（只作约束，非门限来源）：可用性 SLA ≥ {cfg.analysis.sla_target:.1%}"
+        f"{_nines_suffix(cfg.analysis.sla_target)}、质量 SLO ≥ {cfg.analysis.slo_target:.1%}；"
+        "SLA/SLO 的边界值由本次压测实测产出（见结论第一条）"
     )
     lines.append(f"- 压测模式：{cfg.load.mode}，压力级：{cfg.load.concurrency_steps}")
     lines.append("")
@@ -878,7 +961,7 @@ def render_report(
     # 结论 -----------------------------------------------------------------
     lines.append("## 一、结论")
     lines.append("")
-    for item in build_conclusions(cfg, stages, finding, wm_finding, qos):
+    for item in build_conclusions(cfg, stages, finding, wm_finding, qos, sl_finding):
         lines.append(f"- {item}")
     lines.append("")
 
@@ -895,8 +978,10 @@ def render_report(
     lines.append("4. 请求三分类：A1=失败（HTTP 错误/连接失败/超时/流错误/空输出），"
                  "A2=成功且 TTFT、TPOT 双双不超出门限，A3=成功但不达标。")
     lines.append("5. SLA=(A2+A3)/总数，SLO=A2/总数；随并发递增绘制可用性/质量曲线，"
-                 "分别定位 3 个 9（SLA 口径）与 SLO 口径对应的最高并发（连续前缀规则），"
-                 "并以两者同时达标的**质量容量**作为生产并发建议基准。")
+                 "陈述两个实测拐点——A3 拐点（质量/SLO 边界）与 A1 拐点（可用性/SLA 边界），"
+                 "SLA/SLO 由此实测产出；人工价值目标（几个 9 的可用性 + 质量达标率）"
+                 "只用于筛选达标前缀（连续前缀规则），并以两者同时达标的**质量容量**"
+                 "作为生产并发建议基准。")
     if cfg.watermark.enabled:
         lines.append("6. 每级判定水位状态（服务端水位的黑盒投影，见 docs/05-watermark.md）："
                      "NORMAL（无信号）/ BUSY（软水位投影：A3 占比或 TTFT p99 超软门限，"

@@ -36,14 +36,16 @@ class ServiceConfig:
 
 @dataclass
 class SloConfig:
-    """服务质量判定门限。
+    """服务质量判定门限——人工只提"质量价值目标"，尺子默认由实测产出。
 
     target_mode 决定门限从哪来：
-    - ``absolute``（默认）：用下方固定的 ttft_target_s / tpot_target_ms，
-      即业务契约口径，跨次运行可比，适合验收。
-    - ``baseline_relative``：门限由 Phase 0 低负载基线测量的 p99 × 系数得出，
-      按 prompt 长度分桶分别生效，可自动适配不同推理引擎/模型规模。
-      系数是显式配置，结论可复现。
+    - ``baseline_relative``（默认）：门限 = Phase 0 低压基线各长度桶 p99 ×
+      系数。人工唯一需要提的质量价值目标是**退化预算**（"比无压力时慢
+      多少倍算不达标"），绝对时延水平交给实测；换引擎/模型只需重测基线，
+      整条曲线自动平移。此时 A3 拐点的含义是"相对基线的退化起点"。
+    - ``absolute``：用下方固定的 ttft_target_s / tpot_target_ms，即业务
+      契约口径（"p99 TTFT ≤ 2s"这类对外承诺），跨次运行可比，适合验收；
+      此时 A3 拐点的含义是"契约违约起点"。
 
     两种模式都不支持"用本次运行观测到的分位数定标"：那会让门限随压力同步
     抬升，SLO 恒约等于目标值，指标失去分辨力、无法用于验收。
@@ -51,9 +53,9 @@ class SloConfig:
 
     ttft_target_s: float = 2.0        # absolute 模式：首 token 时间目标
     tpot_target_ms: float = 50.0      # absolute 模式：每输出 token 时间目标
-    target_mode: str = "absolute"     # absolute | baseline_relative
-    ttft_factor: float = 3.0          # baseline_relative：TTFT 门限 = 基线 p99 × 本系数
-    tpot_factor: float = 2.0          # baseline_relative：TPOT 门限 = 基线 p99 × 本系数
+    target_mode: str = "baseline_relative"  # baseline_relative | absolute
+    ttft_factor: float = 3.0          # baseline_relative：TTFT 门限 = 基线 p99 × 本系数（质量退化预算）
+    tpot_factor: float = 2.0          # baseline_relative：TPOT 门限 = 基线 p99 × 本系数（质量退化预算）
     min_completion_tokens: int = 2    # 少于此值时 TPOT 不参与判定
 
 
@@ -154,7 +156,20 @@ class QosModelConfig:
 
 @dataclass
 class AnalysisConfig:
-    """结论判定参数。"""
+    """结论判定参数——人工价值目标（只作约束，边界由实测产出）。
+
+    sla_target / slo_target 是**价值目标**，不是门限的来源：
+    - sla_target：可用性目标（几个 9，0.999 = 3 个 9），用于筛选 SLA 达标
+      前缀；SLA 的边界值（A1 拐点）由压测实测产出，见
+      ``metrics.find_service_levels`` 与报告"实测服务等级"结论；
+    - slo_target：质量达标率目标，用于筛选 SLO 达标前缀；SLO 的边界值
+      （A3 拐点）同样由实测产出。
+
+    A2/A3 的判定尺子（时延门限）来自 ``slo.target_mode``：默认
+    baseline_relative（基线实测 p99 × 退化预算系数），absolute 为业务
+    契约验收模式。人工因此只需提两类价值目标：可用性几个 9、质量退化
+    预算——不提任何绝对时延毫秒数。
+    """
 
     sla_target: float = 0.999         # 3 个 9
     slo_target: float = 0.95

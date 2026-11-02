@@ -663,3 +663,77 @@ def find_watermarks(
             "（拒绝或客户端超时），Router 准入策略可能较激进，或配置了无限队列。"
         )
     return finding
+
+
+# ---------------------------------------------------------------------- #
+# 实测服务等级（SLA/SLO 由实测产出，见 docs/01 §1.7）
+# ---------------------------------------------------------------------- #
+
+@dataclass
+class ServiceLevelFinding:
+    """压力 ramp 中实测出来的两个服务等级转折点（结论的一等产出）。
+
+    语义（docs/01 §1.2）：SLA = (A2+A3)/N 由 A1 驱动，SLO = A2/N 由 A3
+    驱动。因此"这个服务能到哪"的答案是两个拐点，而不是任何人工固定值：
+
+    - quality_boundary（质量边界 / SLO 边界 / A3 拐点）：首个 A3 占比达到
+      软门限的并发——质量自该级起系统性劣化（排队开始产生实质伤害）；
+    - availability_boundary（可用性边界 / SLA 边界 / A1 拐点）：首个失败
+      占比达到硬门限（或质量崩塌）的并发——服务自该级起接不住。
+
+    availability_capacity 是人工可用性价值目标（analysis.sla_target，几个 9）
+    约束下的容量，quality_capacity 是双目标口径的质量容量：两者都是"目标
+    达标前缀"，门限严于拐点，比拐点更保守，报告陈述时与拐点分开。
+
+    判据与 classify_watermark 一致，但**不看 watermark.enabled**——边界
+    统计是服务等级结论的一部分，关掉水位渲染时照样给出。
+    """
+
+    quality_boundary: Optional[int] = None
+    availability_boundary: Optional[int] = None
+    availability_capacity: Optional[int] = None
+    quality_capacity: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+
+def find_service_levels(
+    stages: Sequence[StageStats],
+    capacity: CapacityFinding,
+    wm: WatermarkConfig,
+) -> ServiceLevelFinding:
+    """从分级统计中提炼实测服务等级（A3 拐点与 A1 拐点）。
+
+    连续前缀规则：从低压到高压取第一个触发级（判据 = classify_watermark
+    的软/硬门限），避免个别级别抖动造成误报；无完成样本的级不参与。
+    nines 容量与质量容量直接引用 CapacityFinding 的结论（同一批 targets）。
+    """
+    finding = ServiceLevelFinding(
+        availability_capacity=capacity.sla_capacity,
+        quality_capacity=capacity.quality_capacity,
+    )
+    judged = [s for s in sorted(stages, key=lambda s: s.concurrency) if s.n_total > 0]
+    if not judged:
+        finding.notes.append("没有任何带完成样本的压力级，无法确定服务等级边界。")
+        return finding
+
+    for s in judged:
+        state, _reasons = classify_watermark(s, wm)
+        if state in ("BUSY", "OVERLOAD") and finding.quality_boundary is None:
+            finding.quality_boundary = s.concurrency
+        if state == "OVERLOAD" and finding.availability_boundary is None:
+            finding.availability_boundary = s.concurrency
+
+    top = judged[-1].concurrency
+    if finding.quality_boundary is None:
+        finding.notes.append(
+            f"已测至最高并发 {top} 未触达质量拐点（A3 占比全程 < "
+            f"{wm.soft_slo_violation_ratio:.0%}、TTFT p99 未超软门限）："
+            "只说明梯度上限内质量保持基线，不代表服务没有质量边界。"
+        )
+    if finding.availability_boundary is None:
+        finding.notes.append(
+            f"已测至最高并发 {top} 未触达可用性拐点（失败率全程 < "
+            f"{wm.hard_reject_ratio:.0%} 且无质量崩塌）："
+            "只说明梯度上限内可用性保持，不代表服务没有可用性边界。"
+        )
+    return finding

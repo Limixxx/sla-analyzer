@@ -32,6 +32,11 @@ SLA 与 SLO，并评估达到 **3 个 9 可用性（99.9%）** 所能承受的�
 > ——此时任何并发都"可用"，但没有任何质量可言。因此本工具的生产并发建议以
 > **质量容量**（SLA 与 SLO 同时达标的最高连续前缀并发）为唯一基准，
 > SLA 容量仅作为 3 个 9 可用性参考单独陈述。
+>
+> **SLA/SLO 的边界值由压测实测产出**（A3 拐点 = 质量/SLO 边界，A1 拐点 =
+> 可用性/SLA 边界），人工只提价值目标（可用性几个 9 + 质量退化预算），
+> 详见 [5.1 节](#51-人工只提价值目标slaslo-边界由实测产出)与
+> [docs/01](docs/01-metrics-slo-sla.md) §1.7。
 
 时间口径（流式采集，全部基于单调时钟）：
 
@@ -120,8 +125,8 @@ python bench.py --config config.toml --report-only --db results/run1.db --report
 python bench.py --config config.toml --baseline-only
 ```
 
-也可跳过 Phase 0 直接用 absolute 门限压测（配置为 baseline_relative 时会自动
-降级为 absolute 并打印提示）：
+也可跳过 Phase 0：此时默认的 `baseline_relative` 门限自动降级为 absolute
+并打印提示（或显式配置 `slo.target_mode = "absolute"` 走业务契约口径）：
 
 ```bash
 python bench.py --config config.toml --no-baseline
@@ -151,8 +156,10 @@ python bench.py --qos-model results/qos_model.npz \
 2. **请求特征合成**：按权重采样 prompt 长度与输出长度，附加唯一前缀规避前缀缓存；
    真实 token 数以服务端 `usage` 字段为准（落库 `token_source=usage`），
    `chars_per_token` 仅用于无 usage 时的兜底估算。
-3. **容量判定（连续前缀规则）**：按并发升序扫描，分别定位 3 个 9（SLA 口径）、
-   SLO 口径、以及两者同时达标的**质量容量**；遇到第一个样本充足且跌破目标的级别停止。
+3. **容量判定（连续前缀规则）**：按并发升序扫描，先陈述两个实测拐点——
+   A3 拐点（质量/SLO 边界）与 A1 拐点（可用性/SLA 边界），SLA/SLO 由此实测
+   产出；再用人工价值目标分别定位 3 个 9（SLA 口径）、SLO 口径、以及两者
+   同时达标的**质量容量**；遇到第一个样本充足且跌破目标的级别停止。
    样本不足 `min_samples_per_stage` 的级别不参与高置信度前缀，但会进入
    **低置信度参考容量**，防止低压优质级别被整体丢弃。
 4. **低压自适应延时**：闭环模式下低压级别的样本产出速率受单请求 E2E 限制
@@ -175,20 +182,29 @@ python bench.py --qos-model results/qos_model.npz \
 
 ## 5. 判定门限与基线定标
 
-### 5.1 为什么 SLA 不动态化、SLO 门限可自适应
+### 5.1 人工只提价值目标，SLA/SLO 边界由实测产出
 
-- **SLA（可用性目标）是业务契约**，一旦确定就不随测量结果变化——否则"目标随表现
-  浮动"，验收失去意义。本工具中 `analysis.sla_target` 恒为固定配置值。
-- **SLO 门限可以换尺子**，但**绝不能用本次运行观测到的分位数定标**（尤其是高压段）：
-  那会让门限随压力同步抬升，SLO 恒约等于目标值——指标永真、无法验收；
-  且高压段分位数本身已被排队污染（用病态定义正常）。
+- **SLA/SLO 的边界值是压测的产出物，不是人工设定值**：按口径定义
+  （[docs/01-metrics-slo-sla.md](docs/01-metrics-slo-sla.md) §1.2），
+  SLO = A2/N 由 A3 驱动、SLA = (A2+A3)/N 由 A1 驱动——因此
+  **A3 拐点即质量/SLO 边界，A1 拐点即可用性/SLA 边界**。报告结论第一节
+  "实测服务等级"直接陈述这两个拐点（各自由哪个并发开始退化）。
+- **人工只提价值目标，不提绝对时延毫秒数**：可用性几个 9
+  （`analysis.sla_target`，0.999 = 3 个 9）、质量退化预算
+  （`slo.ttft_factor` / `slo.tpot_factor`，基线 p99 的多少倍算不达标）、
+  质量达标率（`analysis.slo_target`）。目标值本身固定——"目标随表现浮动"
+  会让验收失去意义——但它只用于筛选达标前缀，不是门限的来源。
+- **门限尺子默认由实测基线给出（`baseline_relative`）**，但**绝不能用本次
+  运行观测到的分位数定标**（尤其是高压段）：那会让门限随压力同步抬升，
+  SLO 恒约等于目标值——指标永真、无法验收；且高压段分位数本身已被排队
+  污染（用病态定义正常）。`absolute` 保留为业务契约验收模式。
 
 ### 5.2 两种门限模式
 
 | 模式 | 门限来源 | 适用场景 |
 | --- | --- | --- |
-| `absolute` | 固定配置值 `ttft_target_s` / `tpot_target_ms`，所有长度桶统一 | 业务验收契约，跨次运行可比 |
-| `baseline_relative` | Phase 0 低压基线各长度桶 p99 × 系数（`ttft_factor` / `tpot_factor`） | 自动适配不同推理引擎/模型规模；换引擎重测基线即可，整条曲线自动平移 |
+| `baseline_relative`（默认） | Phase 0 低压基线各长度桶 p99 × 系数（`ttft_factor` / `tpot_factor`） | 尺子由实测产出：自动适配不同推理引擎/模型规模；换引擎重测基线即可，整条曲线自动平移 |
+| `absolute` | 固定配置值 `ttft_target_s` / `tpot_target_ms`，所有长度桶统一 | 业务验收契约（对外承诺"p99 TTFT ≤ 2s"这类绝对值），跨次运行可比 |
 
 两种模式都不修改 SLA 目标；区别只在"用什么尺子量 A2/A3"。
 
@@ -275,13 +291,13 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 | `service.timeout_s` | 单请求整体超时 | **必须大于最长合法请求时长**（分钟级请求建议 ≥ 600s），否则误判超时失败 |
 | `requests.max_context_tokens` | 服务支持的上下文上限 | 从服务文档或 `--probe` 的 `/v1/models` 输出获取；prompt+output 超过会直接报错拒绝启动 |
 | `slo.ttft_target_s` / `slo.tpot_target_ms` | 质量门限（absolute 口径） | 按业务约定；先用 `--probe` 实测单请求时延再定 |
-| `slo.target_mode` | 门限来源 | `absolute` 验收用；`baseline_relative` 跨引擎适配用 |
-| `slo.ttft_factor` / `slo.tpot_factor` | baseline_relative 的门限系数 | ≥ 1.0；系数越松达标越易，建议结合退化率表复核 |
+| `slo.target_mode` | 门限来源（A3 判定的尺子） | 默认 `baseline_relative`（尺子由基线实测，人工只提退化预算）；`absolute` 为业务契约验收口径 |
+| `slo.ttft_factor` / `slo.tpot_factor` | baseline_relative 的门限系数（质量退化预算） | ≥ 1.0；"比无压力时慢多少倍算不达标"，系数越松达标越易，建议结合退化率表复核 |
 | `requests.length_buckets` | prompt 长度分桶上界 | 与生产流量长度分布匹配；留空按 `max_context_tokens` 推导 `[ctx/32, ctx/8]` |
 | `requests.prompt_token_targets` | prompt 长度分布 | **应镜像生产流量画像**；留空按 `max_context_tokens` 推导 `[ctx/64, ctx/16, ctx/4]` |
 | `load.baseline_concurrency` / `baseline_duration_s` | Phase 0 基线参数 | 并发必须低于最小压力级；时长保证每桶样本 ≥ `baseline_min_samples`（不足会自动延长并提示） |
-| `analysis.sla_target` | 可用性目标 | 3 个 9 = `0.999`；注意它只是"接得住"，生产建议看质量容量 |
-| `analysis.slo_target` | 质量目标 | 与 SLA 共同构成质量容量判定 |
+| `analysis.sla_target` | 可用性价值目标（几个 9） | 3 个 9 = `0.999`；它只作约束——SLA 的边界（A1 拐点）由实测产出，见报告"实测服务等级" |
+| `analysis.slo_target` | 质量达标率价值目标 | 与 SLA 共同构成质量容量判定；SLO 的边界（A3 拐点）同样由实测产出 |
 | `load.concurrency_steps` | 并发梯度 | 覆盖预期拐点两侧 |
 | `load.max_stage_duration_s` | 单级自适应延时上限 | 闭环低压级别样本不足时自动延长至此；默认 300s。正式级按总量、基线按最短桶判定 |
 | `load.drain_timeout_s` | 在途请求等待上限 | **需大于最长 E2E**，否则最慢请求被记"放弃"导致时延低估 |
@@ -321,7 +337,8 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 - `status='aborted'` 为本级结束时仍在途、超过 drain 上限被放弃的请求，不计入比率
   （`sent_at` 仍为真实发出时刻）
 
-**Markdown 报告（`results/report_<ts>.md`）**：结论（质量容量 + 3 个 9 口径 + SLO 口径
+**Markdown 报告（`results/report_<ts>.md`）**：结论（实测服务等级：A3 拐点 = 质量/SLO
+边界、A1 拐点 = 可用性/SLA 边界 + 质量容量 + 3 个 9 口径 + SLO 口径
 + 水位边界 + 容量判定的补充说明）→ 基线剖析与生效门限（含按桶门限表"来源"列与质量退化率表）
 → 方法 → 分级结果（含 SLO 判定列与水位状态列）→ 延迟分布（含 connect 开销提示）
 → A1 构成 → A3 归因（TTFT/TPOT/双超标 + 按长度桶拆分）
@@ -351,10 +368,10 @@ python bench.py --config config.mock-demo.toml
 `config.mock-demo.toml` 中的 `requests` 段故意只配 `max_context_tokens` 与输出长度，
 prompt 长度分布与长度分桶均**留空**——用于验证按上下文上限的自动推导
 （8K 上下文 → prompt [128, 512, 2048]、桶 [256, 1024]），推导来源会在启动横幅与
-报告"请求特征覆盖"一节标注。把 `[slo] target_mode` 改为 `baseline_relative`
-还可验证基线定标口径：基线阶段按"最短样本长度桶"自适应延长
-（门限 `analysis.baseline_min_samples`），样本仍不足的桶回退 absolute
-并在日志中给出"还差多少/约需多久/建议并发"的量化提示。
+报告"请求特征覆盖"一节标注。该配置显式钉死 `target_mode = "absolute"` 以覆盖契约口径；
+**省略该项即走默认的 `baseline_relative`**（尺子由基线实测），可验证基线定标口径：
+基线阶段按"最短样本长度桶"自适应延长（门限 `analysis.baseline_min_samples`），
+样本仍不足的桶回退 absolute 并在日志中给出"还差多少/约需多久/建议并发"的量化提示。
 
 **无限队列场景自测**（Router 无队列上限：无 429/529，过载投影为客户端超时）：
 
