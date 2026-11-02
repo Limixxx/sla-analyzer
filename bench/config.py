@@ -1,19 +1,62 @@
 """PD 分离推理服务质量（SLO/SLA）基准测试工具的配置加载与校验。
 
-配置格式支持 TOML（Python >= 3.11 内置 tomllib）与 JSON，按扩展名自动识别。
+配置格式支持 TOML（Python >= 3.11 内置 tomllib；以下版本可用 PyPI 的
+tomli/toml 兜底）与 JSON，按扩展名自动识别。
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    import tomllib  # Python >= 3.11
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 及以下
-    tomllib = None  # type: ignore[assignment]
+_TOML_BACKENDS: List[Tuple[str, str]] = [
+    # (模块名, 用法说明)；优先级即列表顺序：内置 > backport > 第三方
+    ("tomllib", "Python >= 3.11 内置"),
+    ("tomli", "tomllib 的 PyPI 向后移植版（pip install tomli）"),
+    ("toml", "第三方 TOML 库（pip install toml）"),
+]
+
+
+def _load_toml_backend() -> Tuple[Optional[Callable[[str], Dict[str, Any]]], Optional[str], Optional[str]]:
+    """按优先级探测可用的 TOML 后端。
+
+    返回 (loads, 后端名, 用法说明)；无可用后端时返回 (None, None, None)。
+    tomli 与 tomllib 同 API（loads(text) -> dict）；toml 库同为 loads(text)
+    但异常类型不同，由调用方统一包装。
+    """
+    for name, note in _TOML_BACKENDS:
+        try:
+            module = __import__(name)
+        except ImportError:
+            continue
+        loads = getattr(module, "loads", None)
+        if loads is None:
+            continue
+        return loads, name, note
+    return None, None, None
+
+
+_TOML_LOADS, _TOML_BACKEND_NAME, _TOML_BACKEND_NOTE = _load_toml_backend()
+
+
+def _parse_toml(text: str) -> Dict[str, Any]:
+    """解析 TOML 文本；后端缺失或解析失败均以 ConfigError 呈现。"""
+    if _TOML_LOADS is None:
+        raise ConfigError(
+            f"当前 Python（{sys.version_info.major}.{sys.version_info.minor}）无可用 TOML 解析后端，"
+            "三选一：① pip install tomli（最省事，配置零改动）；"
+            "② 改用 JSON 配置（后缀 .json，本工具同样支持）；"
+            "③ 升级 Python >= 3.11（内置 tomllib）"
+        )
+    try:
+        return _TOML_LOADS(text)
+    except ConfigError:
+        raise
+    except Exception as exc:  # 后端解析错误统一为 ConfigError
+        raise ConfigError(f"TOML 解析失败（后端 {_TOML_BACKEND_NAME}）：{exc}") from exc
 
 
 class ConfigError(Exception):
@@ -386,9 +429,7 @@ def load_config(path: str) -> Config:
     if not p.exists():
         raise ConfigError(f"配置文件不存在: {path}")
     if p.suffix.lower() == ".toml":
-        if tomllib is None:
-            raise ConfigError("当前 Python 无 tomllib（需要 >= 3.11），请改用 JSON 配置或升级 Python")
-        raw = tomllib.loads(p.read_text(encoding="utf-8"))
+        raw = _parse_toml(p.read_text(encoding="utf-8"))
     elif p.suffix.lower() == ".json":
         raw = json.loads(p.read_text(encoding="utf-8"))
     else:

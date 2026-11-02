@@ -12,11 +12,16 @@
 - 相邻的 `docs/issue/`（`TODO.md`、`PORTS.md`、IGD YAML 等）是 NanHuInfer 侧的调研笔记，不是本项目产物。
 - 工具的运行环境是**集群 Pod 内**：零第三方依赖（Python ≥ 3.11 标准库），可直接拷贝运行。
   这是硬约束，任何新功能不得引入 `pip install`。
+- TOML 解析例外条款：Python < 3.11 无内置 `tomllib` 时，`config.py` 按
+  `tomllib > tomli > toml` 顺序探测——**只在环境已装有时使用**，不写进
+  `requirements.txt`、不强制安装；三者皆无则 fail-fast（提示装 tomli /
+  改 JSON 配置 / 升级 Python）。≥ 3.11 主路径零依赖性质不变。
 
 ## 1. 不可违背的硬约束
 
 1. **零依赖**：只用标准库（`asyncio`/`sqlite3`/`tomllib`/`zipfile`/`struct`）。`requirements.txt` 只做说明。
    ML 模型（`bench/mlp.py`）、`.npz` 容器（`bench/npz.py`）、HTTP/SSE 客户端（`bench/httpclient.py`）都是手写实现。
+   唯一例外：Python < 3.11 的 TOML 解析兜底（见第 0 节例外条款）。
 2. **统计诚实原则**（贯穿全仓，最高优先）：不可信的统计量比没有统计量更危险。
    样本不足、验证不达标、超出训练包络、基线被污染——一律**显式降级 + 喊出来**，绝不静默使用、绝不编造数字。
    典型实现：桶样本不足回退 absolute、`R² < min_r2` 不出预测结论、`extrapolated` 不参与结论、
@@ -116,7 +121,9 @@ python bench.py --config config.mock-demo.toml --report-only \
 "还差多少样本/约需多久/建议并发"的量化提示；样本 < `qos_model.min_samples` 时明确"模型未生成 + 原因"而不是硬训。
 文档级改动跑 `git diff --check` 并核对相对链接与实现映射表。
 
-环境事实（本机已验证）：Windows + Python 3.14.4，工具要求 ≥ 3.11；`--probe` 对 mock 返回
+环境事实（本机已验证）：Windows + Python 3.14.4，工具要求 ≥ 3.11（< 3.11 时装 `tomli`
+后同样验证通过：屏蔽内置 tomllib 时 `config.py` 自动回退 tomli，配置加载结果一致）；
+`--probe` 对 mock 返回
 TTFT≈230ms / TPOT≈21ms / E2E≈1.5s；上面的快速自测约 55 秒跑完。
 **未执行的检查不得描述为通过**；真实集群压测需要用户提供 Router 地址，不可自行发起。
 

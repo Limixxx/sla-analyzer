@@ -1,6 +1,12 @@
-# PD 分离推理 QoS 压测工具运行时零第三方依赖（仅 Python >= 3.11 标准库）。
-# 如需 JSON 配置可替代 TOML（tomllib 自 3.11 内置）。
+# PD 分离推理 QoS 压测工具运行时零第三方依赖（Python >= 3.11 仅标准库）。
+#
+# Python >= 3.11：开箱即用，无需安装任何东西。
+# Python 3.10 及以下：无内置 tomllib，二选一——
+#   a) pip install tomli   （TOML 配置零改动，推荐；已装 toml 亦可被识别）
+#   b) 把配置改写为 JSON（后缀 .json，本工具同样完整支持）
+# 三者（tomllib/tomli/toml）皆无时启动会 fail-fast 并给出上述提示。
+#
 # 可选：安装 tiktoken 后可在你自己的脚本中做更精确的 token 预估，
 #       但本工具默认以服务端返回的 usage 字段为准，无需安装。
 #
-# Python >= 3.11
+# Python >= 3.11（或 3.10 + tomli）
