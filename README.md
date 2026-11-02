@@ -6,7 +6,9 @@ SLA 与 SLO，并评估达到 **3 个 9 可用性（99.9%）** 所能承受的�
 零第三方依赖（Python ≥ 3.11 标准库），可直接拷贝进集群 Pod 内运行。
 
 > **方法论文档**：`docs/` 目录记录本工具的理论基础（指标体系、容量模型、
-> 门限定标、测量有效性、水位语义），回答"为什么这样设计"；本 README 只讲"怎么用"。
+> 门限定标、测量有效性、水位语义、预测模型）与概要设计（架构、运行时序、
+> Phase 0 基线分桶与定标、SLA/SLO 定值），回答"为什么这样设计、由什么组成"；
+> 本 README 只讲"怎么用"。
 
 ---
 
@@ -69,14 +71,15 @@ benchmark/
 │   ├── store.py              #   SQLite 存储（只存特征，不存原文）
 │   ├── runner.py             #   Phase 0 + 递增并发编排（闭环/开环）
 │   └── report.py             #   Markdown 评估报告生成
-├── docs/                     # 方法论文档（理论基础）
+├── docs/                     # 方法论文档（理论基础）+ 概要设计
 │   ├── 00-overview.md        #   总览、文档地图、方法论决策记录
 │   ├── 01-metrics-slo-sla.md #   指标体系：A1/A2/A3、SLA/SLO、TTFT/TPOT
 │   ├── 02-pd-capacity-model.md # 容量模型：PD 分离、两阶段过载、递增并发
 │   ├── 03-threshold-calibration.md # 门限定标：基线定标、长度分桶、退化率
 │   ├── 04-measurement-validity.md # 测量有效性：偏差识别与控制
 │   ├── 05-watermark.md       #   水位语义：服务端水位的黑盒投影（软/硬/SLA）
-│   └── 06-qos-model.md       #   预测模型：压测采样训练 MLP 预测 TTFT/TPOT
+│   ├── 06-qos-model.md       #   预测模型：压测采样训练 MLP 预测 TTFT/TPOT
+│   └── 07-overall-design.md  #   概要设计：架构、时序、基线分桶、SLA/SLO 定值
 └── results/                  # 输出目录（db + report）
 ```
 
