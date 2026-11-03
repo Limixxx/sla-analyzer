@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS stages (
     connect_p99_ms  REAL,
     rps             REAL,
     output_tps      REAL,
+    ok_rps          REAL,
+    input_tps       REAL,
     prompt_tokens_avg   REAL,
     completion_tokens_avg REAL,
     watermark_state TEXT,
@@ -161,6 +163,7 @@ UPDATE stages SET
     e2e_p50_ms=:e2e_p50_ms, e2e_p99_ms=:e2e_p99_ms,
     connect_p50_ms=:connect_p50_ms, connect_p99_ms=:connect_p99_ms,
     rps=:rps, output_tps=:output_tps,
+    ok_rps=:ok_rps, input_tps=:input_tps,
     prompt_tokens_avg=:prompt_tokens_avg, completion_tokens_avg=:completion_tokens_avg,
     watermark_state=:watermark_state, watermark_reasons_json=:watermark_reasons_json,
     fail_kinds_json=:fail_kinds_json, ended_at=:ended_at
@@ -214,6 +217,16 @@ class RecordStore:
         if "watermark_reasons_json" not in cols:
             self._conn.execute(
                 "ALTER TABLE stages ADD COLUMN watermark_reasons_json TEXT"
+            )
+        # 吞吐侧面两列（docs/07 §7.10.2）：旧库无此列时为 NULL，
+        # 读回方按守卫推导（见 bench.py::_stats_from_store）
+        if "ok_rps" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN ok_rps REAL"
+            )
+        if "input_tps" not in cols:
+            self._conn.execute(
+                "ALTER TABLE stages ADD COLUMN input_tps REAL"
             )
         # baseline 表在旧版本数据库中可能已存在（无 duration_actual_s 列）
         base_cols = {

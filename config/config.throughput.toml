@@ -1,0 +1,93 @@
+# 容量（吞吐）场景预设：一次采集、两套分析中的"容量侧"（docs/07 §7.10）。
+#
+# 用法：
+#   python bench.py --config config.throughput.toml
+#   # 产出：在线报告 results/capacity.md + 吞吐报告 results/capacity_throughput.md
+#   #       + 容量面 results/throughput_model.npz（本次膝点已并入）
+#
+#   # 容量规划反查（无需重跑压测）：
+#   python bench.py --capacity-plan results/throughput_model.npz \
+#       --target-rpm 500 --input-len 4096
+#
+# 设计要点（与在线场景共用同一条测量管道，差异只在配置与 report.kinds）：
+# - 负载单位是请求（RPS/并发），与在线场景同一口径；批量作业（job）不是
+#   负载单位，不进入本工具（§7.10.1）。
+# - 批内固定长度：单长度档 + 单长度桶，长度从"分桶统计维度"变为"运行坐标"，
+#   多长度对比靠多次运行汇入同一张容量面（按 L 覆盖更新）。
+# - 容量场景不关心延迟：A3 照常采集（成本为零）但吞吐报告不引用；这里把
+#   Phase 0 基线关掉（load.baseline_enabled=false）省时——少跑低压级，
+#   不少采任何事实；此时按项目规则必须显式 target_mode="absolute"
+#   （baseline_relative + baseline_enabled=false 会 fail-fast）。
+# - 服务等级由吞吐单位承载：SLA = 膝点 ok_rps×60（RPM），
+#   SLO = 膝点 input_tps+output_tps（全量 TPS），同在 A1 拐点（§7.10.3）。
+
+[service]
+base_url = "http://127.0.0.1:8123"   # 改成被测推理服务地址（只测它本身，§7.10.4）
+api_key = ""
+path = "/v1/chat/completions"
+model = "mock-model"                 # 改成实际模型名
+timeout_s = 120.0
+connect_timeout_s = 5.0
+verify_tls = false
+
+[slo]
+# absolute：容量运行不做基线定标（baseline_enabled=false），门限取固定值。
+# 这两个门限仍驱动 A2/A3 分类（照常采集），只是吞吐报告不消费质量读数。
+ttft_target_s = 2.0
+tpot_target_ms = 50.0
+target_mode = "absolute"
+min_completion_tokens = 2
+
+[load]
+mode = "closed"                      # 闭环节流；开环（mode="open" + target_rps）亦可
+concurrency_steps = [4, 8, 16, 24, 32, 48, 64]
+stage_duration_s = 60.0              # 分钟级：每级稳压 60s，全阶梯约 10 分钟
+max_stage_duration_s = 180.0         # 样本不足时单级自适应延长上限
+warmup_s = 10.0
+think_time_s = 0.0
+max_requests_per_stage = 4000
+drain_timeout_s = 30.0
+# 纯容量运行跳过 Phase 0 基线（省时；此时 target_mode 必须为 absolute）
+baseline_enabled = false
+
+[requests]
+max_context_tokens = 8192
+# 固定长度：单档 + 等权，输出长度同样固定——批量场景批内通常是定长
+prompt_token_targets = [4096]
+prompt_weights = [1.0]
+output_token_choices = [512]
+output_weights = [1.0]
+# 单长度桶：定长运行不需要按长度分桶，桶界取到覆盖全部请求即可
+length_buckets = [8192]
+temperature = 0.7
+stream = true
+unique_prefix = true
+seed = 20261103
+chars_per_token = 3.5
+
+[analysis]
+sla_target = 0.999
+slo_target = 0.95
+min_samples_per_stage = 60
+# 窗口承诺（人工价值目标，只作约束）：多长时间内要完成多少请求。
+# 验收线 = 请求数/(小时×60) × 安全余量；实测膝点 RPM ≥ 验收线才判达标。
+# 下面这组是示例（100k/1h ≈ 1667 RPM，单机通常未达标，用于演示未达标路径）；
+# 按业务真实承诺修改，或置 0 表示只陈述实测值、不给达标判定。
+window_requests = 100000
+window_hours = 1.0
+window_safety_factor = 1.1
+
+[storage]
+db_path = "results/capacity.db"
+
+[report]
+# 一次采集、两套分析：online + throughput 同时产出（§7.10.1）。
+# 只要 online 也能单独跑（默认）；只要吞吐则写 kinds = ["throughput"]。
+kinds = ["online", "throughput"]
+output_path = "results/capacity.md"          # 在线报告；吞吐报告自动加 _throughput 后缀
+throughput_model_path = "results/throughput_model.npz"   # 容量面（按 L 覆盖更新）
+
+[qos_model]
+# 容量场景不关心质量预测：关掉 MLP 训练省时（在线报告会注明"模型未生成"）。
+# 想看在线侧全貌（含预测章节）就设 true。
+enabled = false

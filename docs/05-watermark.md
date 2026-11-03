@@ -60,7 +60,7 @@ KV > 硬阈值 / slot 耗尽                    无 429/503
 - **分类上客户端超时本来就是 A1**（`status != "ok"` → A1，见 [01](01-metrics-slo-sla.md)）：SLA 照常拉低、硬水位照常触发，容量结论不受影响；
 - **归因上必须区分 A1 的两个家族**（`bench/metrics.py: split_fail_kinds`）：拒绝族（`rejected`/`http_4xx`/`http_5xx`/`stream_error`）= 服务端明确回绝；超时族（`timeout`/`connect_timeout`）= 服务不拒绝但预算内完不成。报告的过载形态、水位触发原因与治理建议按家族构成给出不同解读（排队型 vs 拒绝型）；
 - **识别信号**：全程无 429/529、失败以 `timeout` 为主 ⇒ Router 疑似无限队列。此时"拒绝阈值/熔断线"无从谈起，治理动作是给队列设上限/排队超时，让过载重新可被观测，而不是调高客户端超时——后者只会把可用性问题继续藏起来；
-- **自测复现**：`mock_server.py --infinite-queue` + `config.mock-infinite-queue.toml`（把 `service.timeout_s` 压到 10s，高压级全部客户端超时）。
+- **自测复现**：`mock_server.py --infinite-queue` + `config/config.mock-infinite-queue.toml`（把 `service.timeout_s` 压到 10s，高压级全部客户端超时）。
 
 ## 三、外部对偶判定规则（范式 B 的对偶）
 

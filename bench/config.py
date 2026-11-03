@@ -212,6 +212,11 @@ class AnalysisConfig:
     baseline_relative（基线实测 p99 × 退化预算系数），absolute 为业务
     契约验收模式。人工因此只需提两类价值目标：可用性几个 9、质量退化
     预算——不提任何绝对时延毫秒数。
+
+    容量（吞吐）场景的价值目标形式是**窗口承诺**（docs/07 §7.10.3）：
+    window_requests / window_hours 描述"多长时间内要完成多少请求"，
+    0 表示不设；两者要么都为 0，要么都须为正。吞吐报告据实测膝点
+    吞吐反推验收线并判定达标，人工只给承诺、不给绝对吞吐值。
     """
 
     sla_target: float = 0.999         # 3 个 9
@@ -228,6 +233,13 @@ class AnalysisConfig:
     # 个总样本（默认 30 → 150 个）。基线阶段的自适应延长以此判据驱动，
     # 结束时会给出"还需多少样本/多少秒"的量化提示。
     baseline_min_samples: int = 30
+    # 窗口承诺（容量场景价值目标）：24h 内 100 万请求 → 反推 μ ≥ 694 RPM。
+    # 0 = 不设（此时吞吐报告只陈述实测值，不给达标判定）。
+    window_requests: int = 0
+    window_hours: float = 0.0
+    # 窗口承诺的安全余量系数：验收线 = 需求 μ × 本系数（≥1，默认 1.1 = 留 10%）。
+    # 只影响达标判定，不影响任何实测值的呈现。
+    window_safety_factor: float = 1.1
 
 
 @dataclass
@@ -237,7 +249,24 @@ class StorageConfig:
 
 @dataclass
 class ReportConfig:
+    """报告产出配置。
+
+    kinds 选择本次运行产出哪些分析报告（docs/07 §7.10.1：一次采集、
+    两套分析——在线分析与容量分析消费同一批落库事实）：
+    - "online"：延迟/质量报告（report.py，默认）；
+    - "throughput"：容量/吞吐报告（report_batch.py + 容量面
+      throughput_model.npz）。
+    两者可同时出现；测量管道不做任何场景裁剪，差异只在分析选择。
+    """
+
     output_path: str = ""
+    kinds: List[str] = field(default_factory=lambda: ["online"])
+    # 容量面（throughput_model.npz）输出路径；--throughput-model 可覆盖。
+    # 与 qos_model.save_path 平行：默认只在产出吞吐报告时才会被写入。
+    throughput_model_path: str = "results/throughput_model.npz"
+
+
+REPORT_KINDS = ("online", "throughput")
 
 
 @dataclass
@@ -289,6 +318,9 @@ class Config:
             "slo_target": self.analysis.slo_target,
             "min_samples_per_stage": self.analysis.min_samples_per_stage,
             "baseline_min_samples": self.analysis.baseline_min_samples,
+            "window_requests": self.analysis.window_requests,
+            "window_hours": self.analysis.window_hours,
+            "window_safety_factor": self.analysis.window_safety_factor,
             "watermark_enabled": self.watermark.enabled,
             "watermark_soft_slo_violation_ratio": self.watermark.soft_slo_violation_ratio,
             "watermark_hard_slo_violation_ratio": self.watermark.hard_slo_violation_ratio,
@@ -302,6 +334,8 @@ class Config:
             "output_token_choices": list(self.requests.output_token_choices),
             "max_context_tokens": self.requests.max_context_tokens,
             "derived_lengths": list(self.derived_lengths),
+            "report_kinds": list(self.report.kinds),
+            "throughput_model_path": self.report.throughput_model_path,
         }
 
 
@@ -517,10 +551,24 @@ def load_config(path: str) -> Config:
         slo_target=_optional(ana_raw, "slo_target", AnalysisConfig.slo_target, float, "analysis"),
         min_samples_per_stage=_optional(ana_raw, "min_samples_per_stage", AnalysisConfig.min_samples_per_stage, int, "analysis"),
         baseline_min_samples=_optional(ana_raw, "baseline_min_samples", AnalysisConfig.baseline_min_samples, int, "analysis"),
+        window_requests=_optional(ana_raw, "window_requests", AnalysisConfig.window_requests, int, "analysis"),
+        window_hours=_optional(ana_raw, "window_hours", AnalysisConfig.window_hours, float, "analysis"),
+        window_safety_factor=_optional(
+            ana_raw, "window_safety_factor", AnalysisConfig.window_safety_factor, float, "analysis"
+        ),
     )
 
     storage = StorageConfig(db_path=str(sto_raw.get("db_path", "")))
-    report = ReportConfig(output_path=str(rep_raw.get("output_path", "")))
+    kinds_raw = rep_raw.get("kinds", ["online"])
+    if not isinstance(kinds_raw, list) or not all(isinstance(k, str) for k in kinds_raw):
+        raise ConfigError("report.kinds 必须是字符串数组，如 [\"online\", \"throughput\"]")
+    report = ReportConfig(
+        output_path=str(rep_raw.get("output_path", "")),
+        kinds=list(kinds_raw),
+        throughput_model_path=str(
+            rep_raw.get("throughput_model_path", ReportConfig.throughput_model_path)
+        ),
+    )
 
     watermark = WatermarkConfig(
         enabled=_optional(wm_raw, "enabled", WatermarkConfig.enabled, bool, "watermark"),
@@ -620,6 +668,29 @@ def validate(cfg: Config) -> None:
         raise ConfigError("权重数组之和不能为 0")
     if r.chars_per_token <= 0:
         raise ConfigError("requests.chars_per_token 必须为正数")
+
+    # 报告选择与容量场景价值目标（docs/07 §7.10）
+    if not cfg.report.kinds:
+        raise ConfigError("report.kinds 不能为空（至少包含 \"online\" 或 \"throughput\"）")
+    bad_kinds = [k for k in cfg.report.kinds if k not in REPORT_KINDS]
+    if bad_kinds:
+        raise ConfigError(
+            f"report.kinds 含未知取值 {bad_kinds}（仅支持 {list(REPORT_KINDS)}）"
+        )
+    if len(set(cfg.report.kinds)) != len(cfg.report.kinds):
+        raise ConfigError("report.kinds 含重复项")
+    a = cfg.analysis
+    if (a.window_requests > 0) != (a.window_hours > 0):
+        raise ConfigError(
+            "analysis.window_requests 与 window_hours 必须同时设置"
+            "（同时为 0 表示不设窗口承诺）"
+        )
+    if a.window_requests < 0 or a.window_hours < 0:
+        raise ConfigError("analysis.window_requests / window_hours 不能为负")
+    if a.window_safety_factor < 1.0:
+        raise ConfigError(
+            "analysis.window_safety_factor 必须 ≥ 1.0（安全余量只放大验收线，不放水）"
+        )
 
     longest = max(r.prompt_token_targets) + max(r.output_token_choices)
     if longest > r.max_context_tokens:

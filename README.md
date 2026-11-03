@@ -53,12 +53,15 @@ Python 3.10 及以下版本在环境已有 `tomli`（或 `toml`）时同样可�
 
 ```
 benchmark/
-├── bench.py                  # CLI 入口（压测 / 探针 / 基线定标 / 报告重建）
+├── bench.py                  # CLI 入口（压测 / 探针 / 基线定标 / 报告重建 / 容量反查）
 ├── mock_server.py            # 本地模拟推理服务（工具自测用，不用于生产）
-├── config.example.toml       # 完整配置示例（复制为 config.toml 修改）
-├── config.mock-demo.toml     # 配合 mock_server 的自测配置（长度参数留空走自动推导）
-├── config.mock-infinite-queue.toml  # 无限队列场景自测（无 429/529，过载投影为客户端超时）
+├── config.example.toml       # 完整配置示例（复制为 config/config.toml 修改）
 ├── requirements.txt          # 零依赖说明
+├── config/                   # 配置预设（复制 example 后按需修改）
+│   ├── config.toml           #   在线评估主配置
+│   ├── config.mock-demo.toml #   配合 mock_server 的自测配置（长度参数留空走自动推导）
+│   ├── config.mock-infinite-queue.toml # 无限队列场景自测（无 429/529，过载投影为客户端超时）
+│   └── config.throughput.toml #  容量/批量场景预设（单长度 + 窗口承诺，出两份报告）
 ├── bench/                    # 核心包
 │   ├── config.py             #   配置加载、校验与长度参数自动推导
 │   ├── prompts.py            #   按 token 预算合成 prompt（唯一前缀防缓存）
@@ -66,13 +69,16 @@ benchmark/
 │   ├── client.py             #   单请求执行、TTFT/TPOT 采集、失败分类
 │   ├── stats.py              #   分位数（最近秩）与均值
 │   ├── baseline.py           #   长度分桶、Phase 0 基线剖析、门限解析
-│   ├── metrics.py            #   A1/A2/A3 分类、分位数、容量与水位判定
+│   ├── metrics.py            #   A1/A2/A3 分类、分位数、容量与水位判定、吞吐聚合
 │   ├── qos.py                #   预测模型：数据集、分组 CV 训练、ECDF 校准、仿真
 │   ├── mlp.py                #   纯 Python 多层感知机（Adam）
 │   ├── npz.py                #   纯标准库 .npz/.npy 读写（numpy 互操作）
 │   ├── store.py              #   SQLite 存储（只存特征，不存原文）
 │   ├── runner.py             #   Phase 0 + 递增并发编排（闭环/开环）
-│   └── report.py             #   Markdown 评估报告生成
+│   ├── format.py             #   Markdown 格式化原语（两套报告共享）
+│   ├── report.py             #   在线评估报告（Markdown）生成
+│   ├── report_batch.py       #   容量/批量场景吞吐报告 + 容量面汇写
+│   └── throughput.py         #   容量面 fit/query/save/load（表格+插值，不训练）
 ├── docs/                     # 方法论文档（理论基础）+ 概要设计
 │   ├── 00-overview.md        #   总览、文档地图、方法论决策记录
 │   ├── 01-metrics-slo-sla.md #   指标体系：A1/A2/A3、SLA/SLO、TTFT/TPOT
@@ -81,8 +87,9 @@ benchmark/
 │   ├── 04-measurement-validity.md # 测量有效性：偏差识别与控制
 │   ├── 05-watermark.md       #   水位语义：服务端水位的黑盒投影（软/硬/SLA）
 │   ├── 06-qos-model.md       #   预测模型：压测采样训练 MLP 预测 TTFT/TPOT
-│   └── 07-overall-design.md  #   概要设计：架构、时序、基线分桶、SLA/SLO 定值
-└── results/                  # 输出目录（db + report）
+│   └── 07-overall-design.md  #   概要设计：架构、时序、基线分桶、SLA/SLO 定值、批量/容量场景
+├── tests/                    # 回归测试（stdlib unittest，无需第三方框架）
+└── results/                  # 输出目录（db + report + npz）
 ```
 
 ## 3. 快速开始
@@ -91,13 +98,13 @@ benchmark/
 cd benchmark
 
 # 1) 复制配置并按实际环境修改（至少改 base_url / model / max_context_tokens）
-cp config.example.toml config.toml
+cp config.example.toml config/config.toml
 
 # 2) 预检（几十秒）：验证连通性、鉴权、端点形态，并实测一次 TTFT/TPOT
-python bench.py --config config.toml --probe
+python bench.py --config config/config.toml --probe
 
 # 3) 正式压测：按 concurrency_steps 逐级施压
-python bench.py --config config.toml
+python bench.py --config config/config.toml
 
 # 4) 查看报告
 cat results/report_<时间戳>.md
@@ -106,7 +113,7 @@ cat results/report_<时间戳>.md
 命令行可覆盖关键参数而不改配置文件：
 
 ```bash
-python bench.py --config config.toml \
+python bench.py --config config/config.toml \
     --base-url http://<router-svc>.<ns>.svc.cluster.local:8000 \
     --model <model-name> --api-key sk-xxx \
     --steps 8,16,32,64,128 --duration 90 --warmup 15 \
@@ -120,21 +127,21 @@ python bench.py --config config.toml \
 从已有数据库重建报告（改判定门限后复盘特别有用）：
 
 ```bash
-python bench.py --config config.toml --report-only --db results/run1.db --report results/run1.md
+python bench.py --config config/config.toml --report-only --db results/run1.db --report results/run1.md
 ```
 
 更换推理引擎/模型后，可先快速重测基线（仅 Phase 0，不施压），确认各长度桶的
 分位数与生效门限符合预期后再跑完整压测：
 
 ```bash
-python bench.py --config config.toml --baseline-only
+python bench.py --config config/config.toml --baseline-only
 ```
 
 也可跳过 Phase 0：此时默认的 `baseline_relative` 门限自动降级为 absolute
 并打印提示（或显式配置 `slo.target_mode = "absolute"` 走业务契约口径）：
 
 ```bash
-python bench.py --config config.toml --no-baseline
+python bench.py --config config/config.toml --no-baseline
 ```
 
 用训练好的模型做单点预测（无需 numpy；模型来自 `qos_model.save_path`
@@ -147,6 +154,29 @@ python bench.py --qos-model results/qos_model.npz \
 ```
 
 关闭预测模型（仅评估、不训练）：`--no-qos`。
+
+**容量/批量场景**（"能消化多少"而非"接得好不好"）：用 `config/config.throughput.toml`
+预设跑一次，同时产出在线报告与吞吐报告（`report.kinds=["online","throughput"]`），
+并落盘容量面 `throughput_model.npz`：
+
+```bash
+python bench.py --config config/config.throughput.toml
+# results/report_<ts>.md          在线报告（同默认口径）
+# results/report_<ts>_throughput.md  吞吐报告（SLA=RPM、SLO=全量 TPS、容量表、膝点证据）
+# results/throughput_model.npz    容量面（多次运行按输入长度合并）
+```
+
+之后对任意（目标 RPM，输入长度）反查所需并发（参考并发，超出测量范围时
+clamp 到端点并标注 `extrapolated`）：
+
+```bash
+python bench.py --capacity-plan results/throughput_model.npz \
+    --target-rpm 600 --input-len 4096
+```
+
+容量口径与在线口径的差别只在分析侧（同一批采集数据）：SLA/SLO 由吞吐单位
+承载（RPM / 全量 TPS，同在 A1 膝点），质量维度不被消费——设计详见
+[docs/07-overall-design.md](docs/07-overall-design.md) §7.10。
 
 ## 4. 测试方法
 
@@ -321,6 +351,10 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 | `qos_model.max_train_seconds` | 训练时长硬上限 | 默认 150s；4000 样本全量验证约 95s，纯 Python 实现的兜底保护 |
 | `qos_model.min_r2` | 验证 R² 下限 | 默认 0.5；低于此值报告只渲染数据口径、不出预测结论 |
 | `qos_model.save_path` | 模型文件路径 | 默认 `results/qos_model.npz`；`--report-only` 时存在则直接加载 |
+| `report.kinds` | 产出哪些报告（可同时多选） | 默认 `["online"]`（与增强前逐字节一致）；`["online","throughput"]` 同时出在线 + 吞吐报告（容量/批量场景） |
+| `report.throughput_model_path` | 容量面文件路径 | 默认 `results/throughput_model.npz`；多次容量运行按输入长度 replace-per-L 合并，不同 base_url 拒绝混装 |
+| `analysis.window_requests` / `analysis.window_hours` | 窗口承诺（人工价值目标的吞吐形式） | 0 = 不设；设置后吞吐报告按"请求数 ÷ 小时数"反推需求 μ 并给达标判定（如 24h/100 万请求 ⇒ ≥ 694 RPM） |
+| `analysis.window_safety_factor` | 窗口承诺安全余量 | 默认 1.1（≥ 1.0）；验收线 = 需求 μ × 系数 |
 
 完整字段见 `config.example.toml` 内注释。
 
@@ -329,9 +363,11 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 **SQLite（`results/bench_<ts>.db`）**：
 
 - `stages`：每级配置与聚合结果（A1/A2/A3、放弃数、SLA/SLO、分位数、connect p50/p99、
-  RPS、输出 tok/s、水位状态 `watermark_state`）。`kind='stage'` 为正式压力级，
+  RPS、输出 tok/s、有效完成速率 `ok_rps`、输入 tok/s、水位状态 `watermark_state`）。
+  `kind='stage'` 为正式压力级，
   `kind='baseline'` 为 Phase 0 基线级（不参与容量判定）；`duration_s` 为配置时长、
-  `actual_duration_s` 为实际时长（含自适应延长与 drain 收尾）
+  `actual_duration_s` 为实际时长（含自适应延长与 drain 收尾）。
+  `ok_rps`/`input_tps` 两列为容量场景新增（可空，旧库由 `rps` 与 token 统计守卫推导读回）
 - `requests`：逐请求**特征**（计划/实际 token 数、connect/TTFT/TPOT/E2E、
   `latency_class` 分类、失败类型），**不保存原始请求与响应内容**。
   正式压力级的每条请求在落库时即回填 A1/A2/A3，可直接按类别检索
@@ -354,6 +390,18 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 残差 ECDF、包络、元数据），可被 numpy 生态 `np.load()` 直接消费；
 纯标准库实现，`--qos-predict` 无 numpy 环境亦可推理。
 
+**吞吐报告（`results/report_<ts>_throughput.md`，`report.kinds` 含 `throughput` 时）**：
+头部边界行（base_url + 运行时刻 + 配置快照）→ 结论（SLA=RPM / SLO=全量 TPS
+vs 窗口承诺验收线、input/output 分解的瓶颈判读）→ 容量表（每级负载水平 →
+ok_rps / total_tps / 分解 / A1 占比 / 样本数）→ 膝点证据（首个 A1 级 + 平台
+佐证）→ A1 归因（拒绝族/超时族）→ 建议 → 方法口径。容量读数取膝点级及低压
+各级 `ok_rps` 的峰值所在级（硬拒绝型坍塌时不把坍塌值当容量，报告中显式说明）。
+
+**容量面（`results/throughput_model.npz`）**：多次容量运行（每次一个固定
+输入长度）的膝点事实按 L 覆盖合并成的表格 + 插值查询面（不训练），
+`--capacity-plan` 反查"扛 X RPM @ 长度 L 需要多少并发"；不同 base_url 的
+面拒绝混装（用两个文件对比）。
+
 ## 8. 工具自测（无需真实服务）
 
 ```bash
@@ -363,14 +411,14 @@ python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --ttft-per-1k-token
     --soft-capacity 8 --hard-capacity 12
 
 # 终端 2：跑自测配置
-python bench.py --config config.mock-demo.toml
+python bench.py --config config/config.mock-demo.toml
 ```
 
 自测已验证的行为：低并发 SLA/SLO=100%；超过 soft 容量后 TPOT 抬升落入 A3
 （SLO 降而 SLA 不降）；超过 hard 容量后大量 503 落入 A1（SLA 断崖）；
 报告以**质量容量**定位生产并发（SLA 100% 但 SLO 归零的级别不会被推荐）。
 
-`config.mock-demo.toml` 中的 `requests` 段故意只配 `max_context_tokens` 与输出长度，
+`config/config.mock-demo.toml` 中的 `requests` 段故意只配 `max_context_tokens` 与输出长度，
 prompt 长度分布与长度分桶均**留空**——用于验证按上下文上限的自动推导
 （8K 上下文 → prompt [128, 512, 2048]、桶 [256, 1024]），推导来源会在启动横幅与
 报告"请求特征覆盖"一节标注。该配置显式钉死 `target_mode = "absolute"` 以覆盖契约口径；
@@ -385,13 +433,33 @@ prompt 长度分布与长度分桶均**留空**——用于验证按上下文上
 python mock_server.py --port 8123 --infinite-queue --queue-step-s 2.0 --soft-capacity 8
 
 # 终端 2：客户端预算压到 10s，高压级全部客户端超时
-python bench.py --config config.mock-infinite-queue.toml
+python bench.py --config config/config.mock-infinite-queue.toml
 ```
 
 预期：并发 ≤ 8 全部 NORMAL；并发 12 排队 ≈8s、成功但 TTFT 超标（BUSY）；
 并发 ≥ 16 排队超 10s 预算，**全程无一条 429/503**，失败全部是 `timeout`
 （A1 超时族）并触发 OVERLOAD。报告的过载形态、水位触发原因与治理建议
 应按"排队型"而非"拒绝型"归因（见 [docs/05-watermark.md](docs/05-watermark.md) 2.1）。
+
+**容量场景自测**（同一 mock 服务，验证"一次采集、两份报告"）：
+
+```bash
+# 终端 1：模拟服务（soft 6 起排队、hard 10 起 503 拒绝——硬拒绝型，
+#         高压级膝点即坍塌，用于验证容量读数的峰值口径）
+python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --soft-capacity 6 --hard-capacity 10
+
+# 终端 2：容量预设（单长度 4096→512、单桶、closed、跳过基线、出两份报告）
+python bench.py --config config/config.throughput.toml
+
+# 反查：扛 600 RPM @ 4096 输入需要多少并发
+python bench.py --capacity-plan results/throughput_model.npz --target-rpm 600 --input-len 4096
+```
+
+预期：同时产出在线报告与吞吐报告；吞吐报告给出 SLA（RPM）/SLO（全量 TPS）、
+逐级容量表、膝点证据与窗口承诺判定。hard 10 之上请求被拒，膝点级 ok_rps
+受过载回落，**容量读数取回落前的低压峰值**并在结论中显式说明（诚实口径，
+见 [docs/07-overall-design.md](docs/07-overall-design.md) §7.10.3）；容量面
+`results/throughput_model.npz` 落盘后可被 `--capacity-plan` 反查。
 
 ## 9. 使用注意与局限
 

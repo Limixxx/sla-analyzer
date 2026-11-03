@@ -25,6 +25,14 @@
     # 6) 用压测采样训练出的 MLP 做单点预测（无需 numpy，见 docs/06-qos-model.md）
     python bench.py --qos-model results/qos_model.npz \
         --qos-predict "concurrency=16,prompt_tokens=4096,completion_tokens=512"
+
+    # 7) 容量（吞吐）场景：report.kinds 含 "throughput" 时同一次运行额外产出
+    #    吞吐报告与容量面（throughput_model.npz，见 docs/07 §7.10）
+    python bench.py --config config.throughput.toml
+
+    # 8) 容量规划反查：扛 X RPM @ 输入长度 L 需要多少并发（无需重跑压测）
+    python bench.py --capacity-plan results/throughput_model.npz \
+        --target-rpm 500 --input-len 2048
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 from bench import __version__, qos
 from bench.baseline import resolve_thresholds
@@ -95,6 +104,26 @@ def _parse_args(argv=None) -> argparse.Namespace:
         metavar="SPEC",
         help='用已有模型做单点预测后退出，如 "concurrency=16,prompt_tokens=4096,completion_tokens=512"',
     )
+    parser.add_argument(
+        "--throughput-model",
+        metavar="PATH",
+        help="覆盖容量面（throughput_model.npz）输出路径（仅产出吞吐报告时写入）",
+    )
+    parser.add_argument(
+        "--capacity-plan",
+        metavar="NPZ",
+        help="对已有容量面反查后退出：扛 --target-rpm @ --input-len 需要多少并发",
+    )
+    parser.add_argument(
+        "--target-rpm",
+        type=float,
+        help="--capacity-plan 的目标吞吐（请求/分钟）",
+    )
+    parser.add_argument(
+        "--input-len",
+        type=int,
+        help="--capacity-plan 的输入长度（token 数）",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -153,6 +182,10 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> None:
     if args.retrain_qos and args.no_qos:
         raise ConfigError("--retrain-qos 与 --no-qos 互斥")
 
+    # 容量面路径（吞吐分析的输出工件，见 docs/07 §7.10.5）
+    if args.throughput_model:
+        cfg.report.throughput_model_path = args.throughput_model
+
 
 def _qos_predict(cfg: Config, spec: str) -> int:
     """--qos-predict：加载模型做单点预测（无需 numpy）。"""
@@ -205,6 +238,87 @@ def _qos_predict(cfg: Config, spec: str) -> int:
               + "；".join(pred.outside) + "），预测不可信、仅供参考")
     print("=" * 72)
     return 0
+
+
+def _capacity_plan(path: str, target_rpm: float, input_len: int) -> int:
+    """--capacity-plan：对容量面反查"扛 X RPM @ 长度 L 需要多少并发"。
+
+    平行于 --qos-predict，但反问题由表格+插值直接回答（不训练，§7.10.5）；
+    L 超出测量范围时 clamp 到端点并显式标注 extrapolated。不依赖配置文件
+    （只用三个显式参数），因此在 load_config 之前分发。
+    """
+    from bench.throughput import ThroughputError, ThroughputSurface
+
+    if target_rpm is None or target_rpm <= 0:
+        raise ConfigError("--capacity-plan 需要 --target-rpm > 0")
+    if input_len is None or input_len <= 0:
+        raise ConfigError("--capacity-plan 需要 --input-len > 0")
+    if not Path(path).exists():
+        print(f"[error] 容量面文件不存在: {path}", file=sys.stderr)
+        print("       先跑一次 report.kinds 含 \"throughput\" 的压测生成容量面，"
+              "或用 --throughput-model 指定路径。", file=sys.stderr)
+        return 2
+    try:
+        surface = ThroughputSurface.load(path)
+    except (ThroughputError, OSError, ValueError) as exc:
+        print(f"[error] 容量面加载失败: {exc}", file=sys.stderr)
+        return 2
+
+    ans = surface.query(target_rpm, input_len)
+    print("=" * 72)
+    print(f"反查输入  : 目标 {target_rpm:g} RPM @ 输入长度 {input_len} tokens")
+    if ans.mu_rpm is None:
+        print("预测容量  : n/a（容量面为空）")
+    else:
+        print(f"预测容量  : μ = {ans.mu_rpm:,.1f} RPM @ 长度 {ans.effective_len}"
+              + (f"（输入 {ans.input_tps:,.0f} + 输出 {ans.output_tps:,.0f} = "
+                 f"{ans.mu_tps:,.0f} tokens/s）" if ans.mu_tps is not None else "（token 数据缺失，仅 RPM 可信）"))
+        print(f"所需并发  : 约 {ans.req_conc}（该长度取得峰值吞吐的负载水平；"
+              "超过它才开始出现失败）")
+        verdict = "可达" if ans.achievable else "不可达"
+        print(f"判定      : {verdict}"
+              + (f"（余量 {ans.margin_rpm:+,.1f} RPM）" if ans.achievable
+                 else f"（缺口 {-ans.margin_rpm:,.1f} RPM）"))
+        print(f"过载形态  : {ans.a1_family}")
+    bound = surface.meta.get("base_url")
+    if bound:
+        print(f"测量边界  : {bound}（与当前 --base-url 不同则结论不适用）")
+    for note in ans.notes:
+        print(f"⚠ 注意    : {note}")
+    print("=" * 72)
+    return 0
+
+
+def _throughput_report_path(output_path: str) -> str:
+    """在线报告 <name>.md → 吞吐报告 <name>_throughput.md（同目录）。"""
+    p = Path(output_path)
+    return str(p.with_name(p.stem + "_throughput" + p.suffix))
+
+
+def _emit_reports(cfg: Config, store: RecordStore, stats, finding, meta: Dict[str, str],
+                  thresholds=None, baseline=None, force_train_qos: bool = False):
+    """按 report.kinds 产出报告（docs/07 §7.10.1：一次采集、两套分析）。
+
+    在线分析与容量分析消费同一批 stats 事实；kinds 之外的分析不产出，
+    测量管道本身不做任何场景裁剪。返回 (报告路径列表, qos 结果或 None)。
+    """
+    from bench.report_batch import write_report_batch
+
+    kinds = set(cfg.report.kinds)
+    paths: List[str] = []
+    qos_result = None
+    if "online" in kinds:
+        qos_result = qos.train_or_load(cfg, store, force_train=force_train_qos)
+        paths.append(write_report(
+            cfg, store, stats, finding, meta, cfg.report.output_path,
+            thresholds=thresholds, baseline=baseline, qos=qos_result,
+        ))
+    if "throughput" in kinds:
+        path, _surface = write_report_batch(
+            cfg, store, stats, finding, meta, _throughput_report_path(cfg.report.output_path)
+        )
+        paths.append(path)
+    return paths, qos_result
 
 
 def _default_paths(cfg: Config) -> None:
@@ -263,6 +377,26 @@ async def _probe_impl(cfg: Config) -> int:
     return 2
 
 
+def _derive_throughput_fallback(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """旧库（无 ok_rps/input_tps 列）时的报告期推导兜底（docs/07 §7.10.2）。
+
+    ok_rps = rps × n_ok/n_total（精确：rps = n_total/window）；
+    input_tps = prompt_tokens_avg × ok_rps（精确：均值×计数=总量，
+    成功请求全部带 usage 时与实时聚合值一致）。任一量缺失返回 None，
+    由吞吐报告走"诚实退化"（RPM 单口径 + 标注 token 覆盖率），
+    不静默填 0（AGENT.md 统计诚实原则）。
+    """
+    rps = row["rps"]
+    n_total = row["n_total"] or 0
+    n_ok = row["n_ok"] or 0
+    if not rps or not n_total:
+        return None, None
+    ok_rps = rps * n_ok / n_total
+    avg = row["prompt_tokens_avg"]
+    input_tps = avg * ok_rps if avg is not None else None
+    return ok_rps, input_tps
+
+
 def _stats_from_store(store: RecordStore, cfg: Config):
     """从数据库重建分级统计（--report-only 路径）。
 
@@ -304,6 +438,16 @@ def _stats_from_store(store: RecordStore, cfg: Config):
             sla_target=cfg.analysis.sla_target,
             slo_target=cfg.analysis.slo_target,
         )
+        # 吞吐侧面两列：新库直接读回；旧库缺列时按充分统计量推导兜底
+        # （守卫式写法，不假设旧库有新列，也不为兼容铺迁移框架）
+        ok_rps = row["ok_rps"] if "ok_rps" in keys else None
+        input_tps = row["input_tps"] if "input_tps" in keys else None
+        if ok_rps is None or input_tps is None:
+            fb_rps, fb_tps = _derive_throughput_fallback(row)
+            ok_rps = ok_rps if ok_rps is not None else fb_rps
+            input_tps = input_tps if input_tps is not None else fb_tps
+        entry.ok_rps = ok_rps
+        entry.input_tps = input_tps
         # 分桶明细：DB 里有则按桶重建，否则退化为单桶（兼容旧库）
         bucket_rows = store.stage_buckets(entry.stage_id)
         if bucket_rows:
@@ -326,6 +470,10 @@ def _stats_from_store(store: RecordStore, cfg: Config):
 
 
 async def _amain(args: argparse.Namespace) -> int:
+    # 容量规划反查不依赖配置文件（只用三个显式参数），在加载配置前分发
+    if args.capacity_plan:
+        return _capacity_plan(args.capacity_plan, args.target_rpm, args.input_len)
+
     cfg = load_config(args.config)
     _apply_cli_overrides(cfg, args)
     _default_paths(cfg)
@@ -373,14 +521,13 @@ async def _amain(args: argparse.Namespace) -> int:
             finding = find_capacity(stats, cfg.analysis)
             meta = store.meta_items()
             meta.setdefault("db_path", cfg.storage.db_path)
-            qos_result = qos.train_or_load(
-                cfg, store, force_train=args.retrain_qos,
+            paths, qos_result = _emit_reports(
+                cfg, store, stats, finding, meta,
+                thresholds=thresholds, baseline=baseline,
+                force_train_qos=args.retrain_qos,
             )
-            path = write_report(
-                cfg, store, stats, finding, meta, cfg.report.output_path,
-                thresholds=thresholds, baseline=baseline, qos=qos_result,
-            )
-            print(f"[done] 报告已生成: {path}")
+            for p in paths:
+                print(f"[done] 报告已生成: {p}")
             return 0
         finally:
             store.close()
@@ -410,6 +557,11 @@ async def _amain(args: argparse.Namespace) -> int:
                      if cfg.watermark.soft_ttft_p99_ms > 0 else ""))
         print(f"  压力级    : {cfg.load.concurrency_steps}  每级 {cfg.load.stage_duration_s}s"
               f"（预热 {cfg.load.warmup_s}s）")
+        print(f"  报告      : {' + '.join(cfg.report.kinds)}")
+        if "throughput" in cfg.report.kinds and cfg.analysis.window_requests > 0:
+            print(f"  窗口承诺  : {cfg.analysis.window_requests:,} 请求 / "
+                  f"{cfg.analysis.window_hours:g} 小时（安全余量 "
+                  f"×{cfg.analysis.window_safety_factor:g}）")
         if cfg.qos_model.enabled:
             print(f"  预测模型  : 开（hidden={cfg.qos_model.hidden}，"
                   f"样本门限 {cfg.qos_model.min_samples}，上限 {cfg.qos_model.max_train_seconds:.0f}s）"
@@ -428,18 +580,18 @@ async def _amain(args: argparse.Namespace) -> int:
         thresholds = runner.thresholds
         baseline = runner.baseline
         finding = find_capacity(stats, cfg.analysis)
-        # 实时压测路径强制重训：刚测出的数据就该训练新模型（想跳过用 --no-qos）；
-        # --report-only 路径才优先加载已有模型文件（避免重复训练成本）。
-        qos_result = qos.train_or_load(cfg, store, force_train=True)
-
         meta = store.meta_items()
-        path = write_report(
-            cfg, store, stats, finding, meta, cfg.report.output_path,
-            thresholds=thresholds, baseline=baseline, qos=qos_result,
+        # 按 report.kinds 产出报告：在线分析与容量分析消费同一批 stats（§7.10.1）；
+        # 实时路径下在线分析强制重训（刚测出的数据就该训练新模型，想跳过用 --no-qos），
+        # --report-only 路径才优先加载已有模型文件（避免重复训练成本）。
+        paths, qos_result = _emit_reports(
+            cfg, store, stats, finding, meta,
+            thresholds=thresholds, baseline=baseline, force_train_qos=True,
         )
         print("=" * 72)
         print(f"[done] 数据库: {cfg.storage.db_path}")
-        print(f"[done] 报告  : {path}")
+        for p in paths:
+            print(f"[done] 报告  : {p}")
         if qos_result is not None and qos_result.model is not None and qos_result.report.usable:
             print(f"[done] 模型  : {qos_result.model_path}"
                   f"（R² TTFT={qos_result.report.r2_ttft:.3f} / "

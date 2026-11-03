@@ -128,6 +128,16 @@ min_samples_per_stage = 60
 # 基线阶段会按"最短样本桶"自适应延长，结束仍不足时给出还差多少/约需多久的提示。
 # 调大提高 p99 置信度但拉长基线时长；调小反之（会降低 p99 置信度）
 baseline_min_samples = 30
+# ---- 窗口承诺（容量/批量场景的人工价值目标，吞吐形式）----
+# 在线评估用不到；report.kinds 含 "throughput" 时，吞吐报告按"请求数 ÷ 小时数"
+# 反推需求 μ 并给达标判定（如 24h 内 100 万请求 ⇒ μ ≥ 694 RPM）。
+# 两个字段必须同时设置（0 = 不设，此时不出判定行）；人工只给承诺，
+# 验收线 = 需求 μ × window_safety_factor，边界值本身仍由压测实测产出
+window_requests = 0
+window_hours = 0.0
+# 验收线的安全余量（≥ 1.0）：容量读数取的是本次运行的单点观测，
+# 承诺留一点余量对抗运行间波动；1.1 即多要 10%
+window_safety_factor = 1.1
 
 [watermark]
 # 水位判定：把每级请求特征翻译成服务端水位的可观测投影（NORMAL/BUSY/OVERLOAD），
@@ -184,3 +194,13 @@ db_path = ""
 [report]
 # 留空则自动生成 results/report_<时间戳>.md
 output_path = ""
+# 产出哪些报告（可同时多选）："online" = 在线评估报告（SLA/SLO/水位/预测）；
+# "throughput" = 容量/批量场景的吞吐报告（SLA=RPM、SLO=全量 TPS、容量表、
+# 膝点证据，详见 docs/07-overall-design.md §7.10）。默认只出在线报告——
+# 两种报告消费的是同一批采集数据（一次采集、两套分析），--report-only
+# 从事后库补报告时同样按本项选择
+kinds = ["online"]
+# 容量面文件：多次容量运行（每次一个固定输入长度）的膝点事实按 L 覆盖
+# 合并成表格 + 插值查询面（不训练），--capacity-plan 反查"扛 X RPM @
+# 长度 L 需要多少并发"。不同 base_url 的面拒绝混装（用两个文件对比）
+throughput_model_path = "results/throughput_model.npz"

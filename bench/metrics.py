@@ -18,6 +18,10 @@ A1 内部按归因家族再分两层（不影响分类本身，只影响"过载�
 - SLA（可用性） = (A2 + A3) / 总数
 - SLO（质量）   = A2 / 总数
 
+吞吐侧面（docs/07 §7.10）：一次采集两侧消费——rps/output_tps 之外补
+ok_rps（有效完成速率）与 input_tps（输入 token 速率），容量结论只认
+ok_rps 系；total_tps = input_tps + output_tps 为读取时派生，不落列。
+
 水位判定（服务端水位的黑盒可观测投影，见 docs/05-watermark.md）：
 每级按 A1/A3 占比与 TTFT p99 判定 NORMAL / BUSY（软水位）/ OVERLOAD（硬水位），
 跨级汇总软/硬/SLA 三个水位边界。
@@ -209,6 +213,11 @@ class StageStats:
 
     rps: Optional[float] = None
     output_tps: Optional[float] = None
+    # 吞吐侧面（docs/07 §7.10.2）：有效完成速率与输入 token 速率。
+    # rps/output_tps 早已存在，但 rps 含失败请求（全部快速失败时反而最高），
+    # 容量结论只认 ok_rps 系；input_tps 与 output_tps 同为双计数一等数据。
+    ok_rps: Optional[float] = None
+    input_tps: Optional[float] = None
     prompt_tokens_avg: Optional[float] = None
     completion_tokens_avg: Optional[float] = None
 
@@ -240,6 +249,18 @@ class StageStats:
         fail_kinds_json 已是充分统计量，避免为派生量加 schema 列。
         """
         return split_fail_kinds(self.fail_kinds)
+
+    @property
+    def total_tps(self) -> Optional[float]:
+        """全量 token 速率 = input_tps + output_tps（读取时派生，不落列）。
+
+        input/output 双计数是一等基础数据（预填充与解码两侧的容量归因），
+        total 只是便利派生；任一侧缺失时返回 None，由报告降级处理，
+        不把缺失静默当成 0。
+        """
+        if self.input_tps is None or self.output_tps is None:
+            return None
+        return self.input_tps + self.output_tps
 
     def as_row(self) -> Dict[str, Any]:
         # 只导出标量字段：字典字段（fail_kinds / bucket_stats）另走专用表
@@ -374,7 +395,8 @@ def compute_stage_stats(
 
     # 吞吐口径：按请求自身的墙钟时间窗计算（含 drain 尾巴），
     # 避免用名义稳压窗口衡量跨窗口完成的请求导致系统性低估。
-    stamped = [r for r in rows if r.get("sent_at")]
+    # 注意 is not None：sent_at=0.0 是合法时刻（纪元起点），不能用真值判断
+    stamped = [r for r in rows if r.get("sent_at") is not None]
     window = None
     if stamped:
         first_start = min(r["sent_at"] for r in stamped)
@@ -385,6 +407,12 @@ def compute_stage_stats(
     if window and window > 0:
         stats.rps = stats.n_total / window
         stats.output_tps = sum(r.get("completion_tokens") or 0 for r in rows) / window
+        # 有效完成速率：只计成功请求。rps 含失败（fast-fail 会刷高），
+        # 容量结论只认 ok_rps 系（docs/07 §7.10.2）。
+        stats.ok_rps = stats.n_ok / window
+        # 输入 token 速率：按成功请求计（与 output_tps 同一有效口径，
+        # 失败请求不产生有效预填充工作量）。
+        stats.input_tps = sum(r.get("prompt_tokens") or 0 for r in ok_rows) / window
     stats.prompt_tokens_avg = mean([r["prompt_tokens"] for r in ok_rows if r.get("prompt_tokens")])
     stats.completion_tokens_avg = mean(
         [r["completion_tokens"] for r in ok_rows if r.get("completion_tokens")]
@@ -687,6 +715,11 @@ class ServiceLevelFinding:
 
     判据与 classify_watermark 一致，但**不看 watermark.enabled**——边界
     统计是服务等级结论的一部分，关掉水位渲染时照样给出。
+
+    容量（吞吐）场景专用口径：``a1_onset=True`` 时 availability_boundary
+    改取"首个出现 A1 的负载水平"（docs/07 §7.10.3）——容量分析不消费质量
+    维度，饱和膝点就是 A1 起点；quality_boundary 仍按原判据计算，只是吞吐
+    报告不引用它。默认 False，在线行为一字不变。
     """
 
     quality_boundary: Optional[int] = None
@@ -700,12 +733,17 @@ def find_service_levels(
     stages: Sequence[StageStats],
     capacity: CapacityFinding,
     wm: WatermarkConfig,
+    a1_onset: bool = False,
 ) -> ServiceLevelFinding:
     """从分级统计中提炼实测服务等级（A3 拐点与 A1 拐点）。
 
     连续前缀规则：从低压到高压取第一个触发级（判据 = classify_watermark
     的软/硬门限），避免个别级别抖动造成误报；无完成样本的级不参与。
     nines 容量与质量容量直接引用 CapacityFinding 的结论（同一批 targets）。
+
+    a1_onset=True（容量场景）：availability_boundary 取首个 A1>0 的级
+    （"首个失败即饱和膝点"），不再要求失败率达到硬门限——容量分析要的是
+    饱和起点，不是违约起点。
     """
     finding = ServiceLevelFinding(
         availability_capacity=capacity.sla_capacity,
@@ -720,7 +758,10 @@ def find_service_levels(
         state, _reasons = classify_watermark(s, wm)
         if state in ("BUSY", "OVERLOAD") and finding.quality_boundary is None:
             finding.quality_boundary = s.concurrency
-        if state == "OVERLOAD" and finding.availability_boundary is None:
+        if a1_onset:
+            if s.a1 > 0 and finding.availability_boundary is None:
+                finding.availability_boundary = s.concurrency
+        elif state == "OVERLOAD" and finding.availability_boundary is None:
             finding.availability_boundary = s.concurrency
 
     top = judged[-1].concurrency
@@ -731,9 +772,16 @@ def find_service_levels(
             "只说明梯度上限内质量保持基线，不代表服务没有质量边界。"
         )
     if finding.availability_boundary is None:
-        finding.notes.append(
-            f"已测至最高并发 {top} 未触达可用性拐点（失败率全程 < "
-            f"{wm.hard_reject_ratio:.0%} 且无质量崩塌）："
-            "只说明梯度上限内可用性保持，不代表服务没有可用性边界。"
-        )
+        if a1_onset:
+            finding.notes.append(
+                f"已测至最高负载 {top} 全程未出现 A1（无失败请求）："
+                "梯度上限内服务未饱和，膝点未触达——容量结论只对该范围有效，"
+                "不代表服务没有饱和点。"
+            )
+        else:
+            finding.notes.append(
+                f"已测至最高并发 {top} 未触达可用性拐点（失败率全程 < "
+                f"{wm.hard_reject_ratio:.0%} 且无质量崩塌）："
+                "只说明梯度上限内可用性保持，不代表服务没有可用性边界。"
+            )
     return finding

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -12,6 +11,7 @@ from . import metrics
 from . import qos as qos_mod
 from .baseline import BaselineResult, Thresholds, bucket_label, bucket_of
 from .config import Config
+from .format import ms as _ms, nines_suffix as _nines_suffix, num as _num, pct as _pct, ratio as _ratio, table as _table
 from .metrics import (
     CapacityFinding,
     ServiceLevelFinding,
@@ -31,44 +31,6 @@ from .qos import (
     simulate_stage,
 )
 from .store import RecordStore
-
-
-def _pct(value: Optional[float], digits: int = 2) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value * 100:.{digits}f}%"
-
-
-def _ms(value: Optional[float]) -> str:
-    return f"{value:.0f}" if value is not None else "n/a"
-
-
-def _num(value: Optional[float], digits: int = 2) -> str:
-    return f"{value:.{digits}f}" if value is not None else "n/a"
-
-
-def _nines_suffix(target: float) -> str:
-    """0.999 → "（3 个 9）"；不是整数个 9 时返回空串（不硬凑）。"""
-    if target >= 1.0:
-        return ""
-    nines = -math.log10(1.0 - target)
-    nearest = round(nines)
-    if nearest >= 1 and abs(nines - nearest) < 0.05:
-        return f"（{nearest} 个 9）"
-    return ""
-
-
-def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
-    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join([" --- "] * len(headers)) + "|"]
-    for row in rows:
-        lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines)
-
-
-def _ratio(current: Optional[float], base: Optional[float]) -> str:
-    if current is None or base is None or base <= 0:
-        return "n/a"
-    return f"×{current / base:.2f}"
 
 
 def _threshold_headline(

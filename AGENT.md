@@ -33,18 +33,19 @@
 5. **时延口径**：一律 `time.monotonic()`；TTFT/E2E 为客户端视角（从建连前起算），
    `connect_ms` 单列可扣减；`sent_at` 取**发出时刻**，不取发现/取消时刻。
 6. **隐私**：`requests` 表只存特征（长度、时延、分类、错误类型），**不存 prompt 与响应正文**。
-7. **方法论决策 D1–D16**（`docs/00-overview.md`）：改动任何判定/分类/统计逻辑前必读对应章节；
+7. **方法论决策 D1–D21**（`docs/00-overview.md`）：改动任何判定/分类/统计逻辑前必读对应章节；
    推翻某条决策要在 `docs/00-overview.md` 的决策表和修订记录里落地，不能只改代码。
 
 ## 2. 阅读顺序
 
 1. `README.md` —— 指标定义、目录结构、快速开始、配置表、局限。
-2. `docs/00-overview.md` —— 文档地图 + D1–D16 决策表 + 一页总览图。
+2. `docs/00-overview.md` —— 文档地图 + D1–D21 决策表 + 一页总览图。
 3. 按需：`01 指标体系`（A1/A2/A3、SLA/SLO、TTFT/TPOT）、`02 容量模型`（两阶段过载、连续前缀）、
    `03 门限定标`（基线、长度分桶、退化率）、`04 测量有效性`（偏差 B1–B9）、
    `05 水位语义`（NORMAL/BUSY/OVERLOAD 投影）、`06 预测模型`（MLP、分组 CV、残差 ECDF、包络）。
-4. 代码：`bench.py`（CLI 与四种运行模式）→ `bench/runner.py`（编排）→ `bench/metrics.py`（判定）→
-   `bench/report.py`（结论渲染）。
+4. 代码：`bench.py`（CLI 与运行模式）→ `bench/runner.py`（编排）→ `bench/metrics.py`（判定）→
+   `bench/report.py`（在线报告渲染）→ `bench/report_batch.py` + `bench/throughput.py`
+   （容量/批量场景：吞吐报告与容量面，[07](docs/07-overall-design.md) §7.10）。
 5. 每篇文档末尾都有**实现映射表**——文档里的每个论断都应能在代码里指到具体函数；反之改代码也要回查映射表是否失效。
 
 ## 3. 架构与数据流
@@ -57,11 +58,13 @@ config.toml/.json → config.py(Config dataclass + 长度自动推导 + validate
       → baseline.py(分桶 + 基线分位数 + 门限解析) / metrics.py(classify、StageStats、find_capacity、水位)
       → qos.py(+mlp.py+npz.py：采样→分组 CV 训练→ECDF 校准→包络守卫→边界细扫)
       → report.py(一~十节 + 附录 A/B) → results/report_<ts>.md
+      → report_batch.py(容量分析：吞吐报告 + 容量面汇写) → results/report_<ts>_throughput.md
+      → throughput.py(容量面 fit/query，经 npz.py) → results/throughput_model.npz
 ```
 
 | 模块 | 职责 | 改动时的关键点 |
 | --- | --- | --- |
-| `bench.py` | CLI、覆盖参数、`--probe`/`--baseline-only`/`--report-only`/`--qos-predict` | 新参数要同步 README 第 3 章与 `--help`；`--duration` 与 `--max-duration` 的 5 倍联动 |
+| `bench.py` | CLI、覆盖参数、`--probe`/`--baseline-only`/`--report-only`/`--qos-predict`/`--capacity-plan` | 新参数要同步 README 第 3 章与 `--help`；`--duration` 与 `--max-duration` 的 5 倍联动 |
 | `bench/config.py` | 加载、类型宽容策略（float 接受 int）、`validate()`、长度推导 | 任何校验都在启动期 fail-fast；`_field_default` 不能写成 `cls.name` |
 | `bench/prompts.py` | 按 token 预算合成、唯一前缀防缓存 | `chars_per_token` 只是估算，真实值以 `usage` 为准 |
 | `bench/httpclient.py` | 零依赖异步 HTTP/1.1 + SSE | 不引第三方；TLS 校验由 `verify_tls` 控制 |
@@ -73,6 +76,9 @@ config.toml/.json → config.py(Config dataclass + 长度自动推导 + validate
 | `bench/store.py` | 建表、插入、按级/桶/基线读回 | 只存特征；`--report-only` 依赖这些列 |
 | `bench/qos.py` `mlp.py` `npz.py` | 数据集、训练协议、校准、仿真、`.npz` 落盘 | A3 必须入训（D16）；按 stage 分组 CV；`.npz` 需与 `np.load()` 互通 |
 | `bench/report.py` | 结论、建议、各级表格、预测章节 | 结论口径与 `metrics.find_capacity` 的 notes 全量渲染，不得吞掉提示 |
+| `bench/format.py` | 两套报告共享的 Markdown 格式化原语（表格/百分比/毫秒） | 在线报告的输出由 golden 测试字节锁定，改原语先跑 `tests/test_isolation.py` |
+| `bench/report_batch.py` | 容量/批量场景：吞吐报告渲染 + 容量面汇写 | 容量读数取峰值口径（D21）；膝点证据与 A1 归因家族渲染；不得 import 进在线路径 |
+| `bench/throughput.py` | 容量面 fit/merge/query/save/load（表格+插值，不训练） | replace-per-L 合并；不同 base_url 拒绝混装；token 缺失存 NaN 读回 None |
 | `mock_server.py` | 本地模拟两阶段过载（soft 排队 / hard 拒绝） | 只用于自测，不进生产结论 |
 
 ## 4. 常见任务的改动清单
@@ -94,27 +100,39 @@ config.toml/.json → config.py(Config dataclass + 长度自动推导 + validate
 **改报告**：章节编号是一~十 + 附录 A/B 的硬编码序列，增删章节要同时改编号、README 第 7 章的产出描述、
 以及 `docs/` 里对该节的引用。
 
-## 5. 验证方式（本项目无测试框架、无 CI）
+## 5. 验证方式（无 CI；`tests/` 为标准库 unittest 套件）
 
-没有 `tests/`、没有 pytest、没有 lint 配置。回归闸门就是下面这几条，改完必须至少跑前两条：
+回归闸门如下，改完必须至少跑前两条：
 
 ```bash
 cd <本目录>
-# 1) 编译 + CLI（秒级）
+# 1) 测试套件（约 25 秒）：单元 + 隔离 + mock E2E，纯标准库 unittest，无需 pytest
+python -m unittest discover -s tests
+# 只跑某个文件：python -m unittest tests.test_metrics_throughput -v
+
+# 2) 编译 + CLI（秒级）
 python -m py_compile bench.py mock_server.py bench/*.py && python bench.py --version
 
-# 2) 端到端自测（约 1 分钟）：两阶段过载 + 基线口径 + 报告全链路
+# 3) 端到端自测（约 1 分钟）：两阶段过载 + 基线口径 + 报告全链路
 python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --ttft-per-1k-tokens 60 \
     --soft-capacity 8 --hard-capacity 12 &
-python bench.py --config config.mock-demo.toml --probe
-python bench.py --config config.mock-demo.toml --steps 4,8,16,32 \
+python bench.py --config config/config.mock-demo.toml --probe
+python bench.py --config config/config.mock-demo.toml --steps 4,8,16,32 \
     --duration 4 --warmup 1 --max-duration 8 --target-mode baseline_relative \
     --db results/tmp_check.db --report results/tmp_check.md
 
-# 3) 复盘幂等性（同库重建报告，结论应与 2) 一致）
-python bench.py --config config.mock-demo.toml --report-only \
+# 4) 复盘幂等性（同库重建报告，结论应与 3) 一致）
+python bench.py --config config/config.mock-demo.toml --report-only \
     --db results/tmp_check.db --report results/tmp_check2.md
 ```
+
+测试套件构成（`tests/`，70 例）：吞吐聚合与 `a1_onset`、store 新旧库迁移与
+守卫读回、批量配置校验、吞吐报告渲染、容量面 fit/query/save/load、
+隔离规则（AST 扫描共享模块禁 import 容量模块 + `tests/golden/online_report.md`
+字节锁定默认在线报告输出）、mock E2E（一次运行两份报告 + 容量面、
+`--report-only` 同 SLA、默认 kinds 只出在线报告、`--capacity-plan` 反查）。
+golden 需要随**有意**的在线报告变更重生成时：`SLA_TEST_REGEN_GOLDEN=1 python -m
+unittest tests.test_isolation`；默认运行下任何字节差即失败。
 
 预期行为（用于判断改动是否破坏了语义）：低压级 SLA/SLO=100%；超过 soft 容量后 TPOT 抬升落入 A3（SLO 降、SLA 不降）；
 超过 hard 容量后大量 503 落入 A1（SLA 断崖）；结论以**质量容量**为准；短桶样本不足时门限回退 absolute 并打印
@@ -144,37 +162,35 @@ TTFT≈230ms / TPOT≈21ms / E2E≈1.5s；上面的快速自测约 55 秒跑完�
   收尾时清理自己创建的，**别人创建的先问再删**。
 - Windows 下会打印 `LF will be replaced by CRLF` 警告，属正常噪音，不影响运行；提交前用 `git status`
   确认只包含预期文件。
-- 本目录处于**活跃并发编辑**中：工作区同时有 `bench/client.py`、`bench/config.py`、`bench/metrics.py`、
-  `bench/report.py`、`mock_server.py` 未提交改动，且改动范围在这次会话期间仍在扩大。
-  动手前必须先 `git status --short` + `git diff` 重新核实现状，基于工作区内容做增量编辑，
-  不要整体重写这些文件，也不要按本文件第 8 节的快照直接下结论。
+- 本目录处于**活跃并发编辑**中：当前工作区有批量/容量增强（[07](docs/07-overall-design.md) §7.10）的
+  未提交改动——修改 `bench.py`、`bench/config.py`、`bench/metrics.py`、`bench/report.py`、
+  `bench/store.py` 与 `docs/00`、`docs/01`、`docs/07`，新增 `bench/format.py`、
+  `bench/report_batch.py`、`bench/throughput.py`、`config/`（含 `config.throughput.toml`，
+  原根目录 `config.mock-*.toml` 移入）与 `tests/`。动手前必须先 `git status --short`
+  + `git diff` 重新核实现状，基于工作区内容做增量编辑，不要整体重写这些文件，
+  也不要按本文件第 8 节的快照直接下结论。
 
-## 8. 进行中的特性快照（2026-10-30，接手前重新核实）
+## 8. 进行中的特性快照（2026-11-03，接手前重新核实）
 
-主题：**无限队列部署下的过载识别**——Router 不返回 429/529 时，过载在客户端只投影为超时，
-需要把 A1 拆成"超时族 / 拒绝族"才能分辨排队型与拒绝型过载。
+主题：**批量/容量场景：一次采集、两套分析**——设计定稿见
+[docs/07-overall-design.md](docs/07-overall-design.md) §7.10，本快照描述其落地状态。
+上一个快照的主题（无限队列部署下的过载识别）已落地提交，配套文档缺口已补齐。
 
-- `bench/metrics.py`：新增 `A1_TIMEOUT_KINDS`（timeout、connect_timeout）、`A1_REJECT_KINDS`
-  （rejected、http_4xx、http_5xx、stream_error）、`split_fail_kinds()` 与 `StageStats.a1_families()`；
-  `classify_watermark` 在 A1 触发硬水位时附带家族归因（超时族主导 ⇒ 疑似无限队列/排队耗尽；
-  拒绝族主导 ⇒ 拒绝型过载）。
-- `bench/report.py`：结论、建议、预测章节口径说明处消费上述归因（"A1 拒绝型" 措辞改为 "A1 失败型"，
-  并明确模型不预测失败概率）。
-- `bench/config.py` / `bench/client.py`：`[watermark]` 与 `KIND_*` 的注释同步新语义。
-- `mock_server.py`：新增 `--infinite-queue` / `--queue-step-s`，模拟不拒绝、排队时间随超出量无上限增长的部署。
-
-该自测变体可用于验证超时族归因（其余参数同上）：
-
-```bash
-python mock_server.py --port 8123 --infinite-queue --queue-step-s 2.0
-```
-
-**尚未完成的配套**：`docs/05-watermark.md` 还没有代码注释所引用的"无限队列"一节；`README.md` 第 1/5/8 章
-（A1 定义、水位表、自测说明）与 `docs/01` 的 A1 定义未提及家族拆分与 `--infinite-queue`；
-`docs/00-overview.md` 的 D1–D16 决策表与修订记录未更新。按第 4 章清单补齐前先与用户确认。
-
-已知文档引用缺口：`docs/05-watermark.md` 开头把术语来源写作 `results/watermark.md`，该文件不在仓库内
-（且被 `.gitignore` 规则覆盖）——引用外部资料时应改指向仓库内可见文档或明确标注其在工作区外。
+- **已落地（随本次变更提交）**：`ok_rps`/`input_tps` 两个聚合字段与 `stages`
+  两列（可空、旧库守卫读回）、`find_service_levels(..., a1_onset=True)` 可选
+  参数（默认 False，在线行为不变）、`report.kinds` 与窗口承诺配置
+  （`analysis.window_requests` / `window_hours` / `window_safety_factor`）、
+  `bench/format.py`（两套报告共享的格式化原语）、`bench/report_batch.py`
+  （吞吐报告 + 容量面汇写）、`bench/throughput.py`（容量面 fit/query/save/load）、
+  `config.throughput.toml` 预设、`--throughput-model` / `--capacity-plan` /
+  `--target-rpm` / `--input-len` flag、`tests/` 70 例测试套件（§5 闸门 #1）。
+- **实现口径修正（E2E 逼出，已入文档 D21 与 07 §7.10.3/§7.10.5）**：容量读数
+  取膝点级及低压各级 `ok_rps` 的峰值所在级（硬拒绝型坍塌时不把坍塌值当容量，
+  结论中显式说明）；`req_conc` 记录取得峰值吞吐的负载水平，`--capacity-plan`
+  输出的"所需并发"是参考并发。
+- **在线路径零影响已锁定**：默认 `report.kinds=["online"]` 的输出与增强前
+  逐字节一致，由 `tests/test_isolation.py` 的 golden 文件断言；共享模块
+  （runner/client/metrics/store）禁 import 容量模块，由 AST 扫描断言。
 
 ## 9. 与用户协作
 
