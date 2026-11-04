@@ -148,19 +148,37 @@ def make_config(
     window_hours: float = 0.0,
     window_safety_factor: float = 1.1,
     prompt_token_targets: Optional[Sequence[int]] = None,
+    output_token_choices: Optional[Sequence[int]] = None,
     concurrency_steps: Optional[Sequence[int]] = None,
     throughput_model_path: str = "",
     output_path: str = "results/_test_report.md",
 ) -> Config:
-    """一份最小但合法的 Config（不走 TOML，直接构造 dataclass）。"""
+    """一份最小但合法的 Config（不走 TOML，直接构造 dataclass）。
+
+    output_token_choices 缺省沿用 RequestConfig 全局默认（[128, 256] /
+    [0.7, 0.3]，与在线 golden 报告一致）；容量面测试需要单 (L_in, L_out)
+    坐标时显式传单档（如 [512]）——混合档会让 knee_point 诚实降级为
+    None（D22）。
+    """
+    ins = list(prompt_token_targets or [4096])
+    if output_token_choices is None:
+        requests = RequestConfig(
+            prompt_token_targets=ins,
+            prompt_weights=[1.0 / len(ins)] * len(ins),
+        )
+    else:
+        outs = list(output_token_choices)
+        requests = RequestConfig(
+            prompt_token_targets=ins,
+            prompt_weights=[1.0 / len(ins)] * len(ins),
+            output_token_choices=outs,
+            output_weights=[1.0 / len(outs)] * len(outs),
+        )
     return Config(
         service=ServiceConfig(base_url=base_url),
         slo=SloConfig(),
         load=LoadConfig(concurrency_steps=sorted(set(concurrency_steps or [2, 4, 8, 16]))),
-        requests=RequestConfig(
-            prompt_token_targets=list(prompt_token_targets or [4096]),
-            prompt_weights=[1.0 / len(prompt_token_targets or [4096])] * len(prompt_token_targets or [4096]),
-        ),
+        requests=requests,
         analysis=AnalysisConfig(
             window_requests=window_requests,
             window_hours=window_hours,

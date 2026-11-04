@@ -162,20 +162,26 @@ python bench.py --qos-model results/qos_model.npz \
 ```bash
 python bench.py --config config/config.throughput.toml
 # results/report_<ts>.md          在线报告（同默认口径）
-# results/report_<ts>_throughput.md  吞吐报告（SLA=RPM、SLO=全量 TPS、容量表、膝点证据）
-# results/throughput_model.npz    容量面（多次运行按输入长度合并）
+# results/report_<ts>_throughput.md  吞吐报告（SLA=RPM、SLO=全量 TPS、容量表、膝点证据、
+#                                    数据质量诊断、超时预算同印）
+# results/throughput_model.npz    容量面（多次运行按 (输入, 输出) 长度单元格合并，D22）
 ```
 
-之后对任意（目标 RPM，输入长度）反查所需并发（参考并发，超出测量范围时
-clamp 到端点并标注 `extrapolated`）：
+单 `(L_in, L_out)` 组合的运行才入容量面（输出长度是容量主控变量，必须进
+坐标而非钉死常量）；换输出档位再跑一次即在同一张面上多占一格。要铺二维
+网格建议先跑四个角点。之后对任意（目标 RPM，输入/输出长度）反查所需并发
+（参考并发；任一坐标超出测量范围时 clamp 到端点并标注 `extrapolated`）：
 
 ```bash
 python bench.py --capacity-plan results/throughput_model.npz \
-    --target-rpm 600 --input-len 4096
+    --target-rpm 600 --input-len 4096 --output-len 512
 ```
 
 容量口径与在线口径的差别只在分析侧（同一批采集数据）：SLA/SLO 由吞吐单位
-承载（RPM / 全量 TPS，同在 A1 膝点），质量维度不被消费——设计详见
+承载（RPM / 全量 TPS，同在 A1 膝点），质量维度不被消费。全程无 A1 的软退化
+服务（永不拒绝、只变慢）以平台期第二读数收场（"范围内饱和读数"，标注非
+膝点）；所有容量读数均与 `service.timeout_s` 同印——膝点 = 服务拒绝**或**
+客户放弃，不同超时预算下的数字不可比。设计详见
 [docs/07-overall-design.md](docs/07-overall-design.md) §7.10。
 
 ## 4. 测试方法
@@ -352,7 +358,7 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 | `qos_model.min_r2` | 验证 R² 下限 | 默认 0.5；低于此值报告只渲染数据口径、不出预测结论 |
 | `qos_model.save_path` | 模型文件路径 | 默认 `results/qos_model.npz`；`--report-only` 时存在则直接加载 |
 | `report.kinds` | 产出哪些报告（可同时多选） | 默认 `["online"]`（与增强前逐字节一致）；`["online","throughput"]` 同时出在线 + 吞吐报告（容量/批量场景） |
-| `report.throughput_model_path` | 容量面文件路径 | 默认 `results/throughput_model.npz`；多次容量运行按输入长度 replace-per-L 合并，不同 base_url 拒绝混装 |
+| `report.throughput_model_path` | 容量面文件路径 | 默认 `results/throughput_model.npz`；多次容量运行按 `(输入, 输出)` 长度单元格 replace-per-cell 合并（D22），不同 base_url 拒绝混装 |
 | `analysis.window_requests` / `analysis.window_hours` | 窗口承诺（人工价值目标的吞吐形式） | 0 = 不设；设置后吞吐报告按"请求数 ÷ 小时数"反推需求 μ 并给达标判定（如 24h/100 万请求 ⇒ ≥ 694 RPM） |
 | `analysis.window_safety_factor` | 窗口承诺安全余量 | 默认 1.1（≥ 1.0）；验收线 = 需求 μ × 系数 |
 
@@ -391,16 +397,22 @@ TTFT 主导 → prefill 平面（算力/准入排队），TPOT 主导 → decode
 纯标准库实现，`--qos-predict` 无 numpy 环境亦可推理。
 
 **吞吐报告（`results/report_<ts>_throughput.md`，`report.kinds` 含 `throughput` 时）**：
-头部边界行（base_url + 运行时刻 + 配置快照）→ 结论（SLA=RPM / SLO=全量 TPS
-vs 窗口承诺验收线、input/output 分解的瓶颈判读）→ 容量表（每级负载水平 →
-ok_rps / total_tps / 分解 / A1 占比 / 样本数）→ 膝点证据（首个 A1 级 + 平台
-佐证）→ A1 归因（拒绝族/超时族）→ 建议 → 方法口径。容量读数取膝点级及低压
-各级 `ok_rps` 的峰值所在级（硬拒绝型坍塌时不把坍塌值当容量，报告中显式说明）。
+头部边界行（base_url + 运行时刻 + 配置快照 + **超时预算**）→ 结论（SLA=RPM /
+SLO=全量 TPS vs 窗口承诺验收线、input/output 分解的瓶颈判读）→ 容量表（每级
+负载水平 → ok_rps / total_tps / 分解 / A1 占比 / 样本数）+ **数据质量诊断**
+（D24：Little's Law 一致性与时延恒等式，偏差 >15% 标红，只警告不阻断）→ 膝点
+证据（首个 A1 级 + 平台佐证）→ A1 归因（拒绝族/超时族）→ 建议 → 方法口径。
+容量读数取膝点级及低压各级 `ok_rps` 的峰值所在级（硬拒绝型坍塌时不把坍塌值
+当容量，报告中显式说明）；全程无 A1 的软退化服务以**平台期第二读数**收场
+（末级边际增幅 <5% → "范围内饱和读数"，明确标注非膝点、只对已测范围与超时
+预算有效，D23）。
 
 **容量面（`results/throughput_model.npz`）**：多次容量运行（每次一个固定
-输入长度）的膝点事实按 L 覆盖合并成的表格 + 插值查询面（不训练），
-`--capacity-plan` 反查"扛 X RPM @ 长度 L 需要多少并发"；不同 base_url 的
-面拒绝混装（用两个文件对比）。
+`(输入, 输出)` 长度组合，D22）的读数按单元格覆盖合并成的表格 + 双线性插值
+查询面（不训练），`--capacity-plan` 反查"扛 X RPM @ (L_in, L_out) 需要多少
+并发"并随印读数来源（膝点实测 / 软退化平台估计）；任一坐标超范围 clamp 并标
+`extrapolated`，角点未实测时回退最近实测点并说明（建议按四角点铺床）；不同
+base_url 的面拒绝混装（用两个文件对比）。
 
 ## 8. 工具自测（无需真实服务）
 
@@ -451,15 +463,17 @@ python mock_server.py --port 8123 --ttft-ms 200 --tpot-ms 15 --soft-capacity 6 -
 # 终端 2：容量预设（单长度 4096→512、单桶、closed、跳过基线、出两份报告）
 python bench.py --config config/config.throughput.toml
 
-# 反查：扛 600 RPM @ 4096 输入需要多少并发
-python bench.py --capacity-plan results/throughput_model.npz --target-rpm 600 --input-len 4096
+# 反查：扛 600 RPM @ 4096 输入 / 512 输出需要多少并发
+python bench.py --capacity-plan results/throughput_model.npz --target-rpm 600 \
+    --input-len 4096 --output-len 512
 ```
 
 预期：同时产出在线报告与吞吐报告；吞吐报告给出 SLA（RPM）/SLO（全量 TPS）、
-逐级容量表、膝点证据与窗口承诺判定。hard 10 之上请求被拒，膝点级 ok_rps
-受过载回落，**容量读数取回落前的低压峰值**并在结论中显式说明（诚实口径，
-见 [docs/07-overall-design.md](docs/07-overall-design.md) §7.10.3）；容量面
-`results/throughput_model.npz` 落盘后可被 `--capacity-plan` 反查。
+逐级容量表、数据质量诊断、膝点证据、超时预算行与窗口承诺判定。hard 10 之上
+请求被拒，膝点级 ok_rps 受过载回落，**容量读数取回落前的低压峰值**并在结论
+中显式说明（诚实口径，见 [docs/07-overall-design.md](docs/07-overall-design.md)
+§7.10.3）；容量面 `results/throughput_model.npz` 以坐标 (4096, 512) 落盘，
+可被 `--capacity-plan` 反查（缺 `--output-len` 时按最小输出档作答并提示）。
 
 ## 9. 使用注意与局限
 

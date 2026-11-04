@@ -30,9 +30,9 @@
     #    吞吐报告与容量面（throughput_model.npz，见 docs/07 §7.10）
     python bench.py --config config.throughput.toml
 
-    # 8) 容量规划反查：扛 X RPM @ 输入长度 L 需要多少并发（无需重跑压测）
+    # 8) 容量规划反查：扛 X RPM @ (输入 L_in, 输出 L_out) 需要多少并发（无需重跑压测）
     python bench.py --capacity-plan results/throughput_model.npz \
-        --target-rpm 500 --input-len 2048
+        --target-rpm 500 --input-len 4096 --output-len 512
 """
 
 from __future__ import annotations
@@ -112,7 +112,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--capacity-plan",
         metavar="NPZ",
-        help="对已有容量面反查后退出：扛 --target-rpm @ --input-len 需要多少并发",
+        help="对已有容量面反查后退出：扛 --target-rpm @ --input-len（--output-len）"
+             " 需要多少并发",
     )
     parser.add_argument(
         "--target-rpm",
@@ -123,6 +124,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--input-len",
         type=int,
         help="--capacity-plan 的输入长度（token 数）",
+    )
+    parser.add_argument(
+        "--output-len",
+        type=int,
+        help="--capacity-plan 的输出长度（token 数）；二维容量面建议显式指定，"
+             "缺省时按最小输出档作答并提示（D22）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
@@ -240,12 +247,16 @@ def _qos_predict(cfg: Config, spec: str) -> int:
     return 0
 
 
-def _capacity_plan(path: str, target_rpm: float, input_len: int) -> int:
-    """--capacity-plan：对容量面反查"扛 X RPM @ 长度 L 需要多少并发"。
+def _capacity_plan(path: str, target_rpm: float, input_len: int,
+                   output_len: Optional[int]) -> int:
+    """--capacity-plan：对容量面反查"扛 X RPM @ (L_in, L_out) 需要多少并发"。
 
     平行于 --qos-predict，但反问题由表格+插值直接回答（不训练，§7.10.5）；
-    L 超出测量范围时 clamp 到端点并显式标注 extrapolated。不依赖配置文件
-    （只用三个显式参数），因此在 load_config 之前分发。
+    坐标超出测量范围时 clamp 到端点并显式标注 extrapolated。output_len
+    可缺省（None）：一维面按输入长度插值；二维面取最小输出档作答并提示
+    显式指定（D22）。读数来源（knee/plateau，D23）随结果同印——平台估计
+    与膝点实测口径不同。不依赖配置文件（只用显式参数），因此在
+    load_config 之前分发。
     """
     from bench.throughput import ThroughputError, ThroughputSurface
 
@@ -253,6 +264,8 @@ def _capacity_plan(path: str, target_rpm: float, input_len: int) -> int:
         raise ConfigError("--capacity-plan 需要 --target-rpm > 0")
     if input_len is None or input_len <= 0:
         raise ConfigError("--capacity-plan 需要 --input-len > 0")
+    if output_len is not None and output_len <= 0:
+        raise ConfigError("--output-len 必须为正整数（不想指定则省略该参数）")
     if not Path(path).exists():
         print(f"[error] 容量面文件不存在: {path}", file=sys.stderr)
         print("       先跑一次 report.kinds 含 \"throughput\" 的压测生成容量面，"
@@ -264,22 +277,29 @@ def _capacity_plan(path: str, target_rpm: float, input_len: int) -> int:
         print(f"[error] 容量面加载失败: {exc}", file=sys.stderr)
         return 2
 
-    ans = surface.query(target_rpm, input_len)
+    ans = surface.query(target_rpm, input_len, output_len or 0)
     print("=" * 72)
-    print(f"反查输入  : 目标 {target_rpm:g} RPM @ 输入长度 {input_len} tokens")
+    out_txt = f"，输出 {output_len} tokens" if output_len else "，输出 未指定"
+    print(f"反查输入  : 目标 {target_rpm:g} RPM @ 输入 {input_len} tokens{out_txt}")
     if ans.mu_rpm is None:
         print("预测容量  : n/a（容量面为空）")
     else:
-        print(f"预测容量  : μ = {ans.mu_rpm:,.1f} RPM @ 长度 {ans.effective_len}"
+        coord = f"@ 输入 {ans.effective_len}"
+        if ans.effective_output_len:
+            coord += f" / 输出 {ans.effective_output_len}"
+        print(f"预测容量  : μ = {ans.mu_rpm:,.1f} RPM {coord}"
               + (f"（输入 {ans.input_tps:,.0f} + 输出 {ans.output_tps:,.0f} = "
                  f"{ans.mu_tps:,.0f} tokens/s）" if ans.mu_tps is not None else "（token 数据缺失，仅 RPM 可信）"))
-        print(f"所需并发  : 约 {ans.req_conc}（该长度取得峰值吞吐的负载水平；"
+        print(f"所需并发  : 约 {ans.req_conc}（该坐标取得峰值吞吐的负载水平；"
               "超过它才开始出现失败）")
         verdict = "可达" if ans.achievable else "不可达"
         print(f"判定      : {verdict}"
               + (f"（余量 {ans.margin_rpm:+,.1f} RPM）" if ans.achievable
                  else f"（缺口 {-ans.margin_rpm:,.1f} RPM）"))
         print(f"过载形态  : {ans.a1_family}")
+    origin_txt = {"knee": "膝点实测", "plateau": "软退化平台估计（非膝点，D23）"}.get(
+        ans.origin, ans.origin)
+    print(f"读数来源  : {origin_txt}")
     bound = surface.meta.get("base_url")
     if bound:
         print(f"测量边界  : {bound}（与当前 --base-url 不同则结论不适用）")
@@ -470,9 +490,10 @@ def _stats_from_store(store: RecordStore, cfg: Config):
 
 
 async def _amain(args: argparse.Namespace) -> int:
-    # 容量规划反查不依赖配置文件（只用三个显式参数），在加载配置前分发
+    # 容量规划反查不依赖配置文件（只用显式参数），在加载配置前分发
     if args.capacity_plan:
-        return _capacity_plan(args.capacity_plan, args.target_rpm, args.input_len)
+        return _capacity_plan(args.capacity_plan, args.target_rpm, args.input_len,
+                              args.output_len)
 
     cfg = load_config(args.config)
     _apply_cli_overrides(cfg, args)

@@ -1,0 +1,186 @@
+# PD 分离推理 QoS 压测配置示例
+# 复制为 config.toml 后按实际环境修改。所有时长单位均为秒。
+
+[service]
+# Router（前端入口）地址；Grove 模式下通常是 router serving Service 的 DNS 或 NodePort
+base_url = "http://127.0.0.1:9990"
+# 如需鉴权
+api_key = ""
+# OpenAI 兼容端点；纯 completions 端点也可（工具自动适配 prompt/messages 形态）
+path = "/v1/chat/completions"
+model = "default"
+# 单请求整体超时：分钟级请求必须显著大于最长合法请求时长，否则误判为超时失败
+timeout_s = 600.0
+connect_timeout_s = 10.0
+verify_tls = false
+# extra_headers = { "X-Tenant-Id" = "demo" }
+
+[slo]
+# TTFT 目标（首 token 时间），秒。口径为客户端视角：从建连前起算，
+# 含 TCP/TLS 建连与请求写出；建连开销单独记录为 connect_ms 并在报告中给出分位数，
+# 跨机房/TLS 部署下解读时应予扣除
+ttft_target_s = 2.0
+# TPOT 目标（每输出 token 时间），毫秒
+tpot_target_ms = 50.0
+# 输出 token 少于此值时 TPOT 不参与判定（避免极短输出的统计噪声）
+min_completion_tokens = 2
+# 门限来源（A3 判定的尺子从哪来）：
+#   baseline_relative（默认）—— 由 Phase 0 低压基线各长度桶的 p99 × 系数生成：
+#      人工只提"质量退化预算"（系数，见下），绝对时延水平交给实测；换引擎/模型
+#      只需重测基线，曲线自动平移。此时 A3 拐点是"相对基线的退化起点"
+#   absolute        —— 用上方固定值，业务契约口径（对外承诺 p99 TTFT ≤ 2s 这类），
+#      跨次运行可比，适合验收。此时 A3 拐点是"契约违约起点"
+# 两种模式都【不】支持"用本次运行观测到的分位数定标"：那会让门限随压力同步抬升，
+# SLO 恒约等于目标值，指标失去分辨力，无法验收。
+target_mode = "baseline_relative"
+# 仅 baseline_relative 生效：门限 = 该长度桶基线 p99 × 系数，即"质量退化预算"
+# （比无压力时慢多少倍算不达标）。必须 >= 1.0
+ttft_factor = 3.0
+tpot_factor = 2.0
+
+[load]
+# closed = 闭环固定并发（推荐，用于探测 Router 缓冲/拒绝边界）
+# open   = 开环固定 RPS（需配置 target_rps）
+mode = "closed"
+# 递增并发梯度：由低压到高压逐级施压，建议覆盖预期拐点两侧
+concurrency_steps = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
+# 每级稳压时长（秒）；闭环低压级别样本产出受单请求 E2E 限制，样本不足会自动延长
+stage_duration_s = 60.0
+# 每级稳压时长的自适应上限（秒）：测量段样本不足时逐级延长至此为止，
+# 防止"并发 1、E2E≈3.5s 时 60s 仅 17 个样本"导致低压优质级别被整体排除在容量判定外。
+# 正式级按"测量段总量"判定；Phase 0 基线按"最短样本长度桶"判定（门限是按桶解析的，
+# 总量够而最短桶不够照样回退 absolute）。命令行 --duration 覆盖时本上限按 5 倍联动，
+# 可用 --max-duration 显式指定
+max_stage_duration_s = 300.0
+# 每级预热时长（秒），预热数据不计入统计
+warmup_s = 10.0
+# 闭环模式下每次请求前的思考时间（秒）
+think_time_s = 0.0
+# 每级请求数上限（防止高压级样本爆炸）；预热段单独计数
+max_requests_per_stage = 5000
+max_warmup_requests_per_stage = 5000
+# 到点后在途请求的最大等待（秒）：需大于最长 E2E，否则最慢的请求会被记为"放弃"
+# （aborted）而不计入统计，造成时延低估
+drain_timeout_s = 120.0
+# 仅 open 模式生效
+target_rps = 0.0
+max_inflight = 4096
+# ---- Phase 0 基线剖析 ----
+# 正式 ramp 之前，先用低压并发测一次"无压力时的服务时延"，产出各长度桶的
+# TTFT/TPOT 分位数。仅当 slo.target_mode=baseline_relative 时其分位数才参与
+# 门限计算；absolute 模式下也会执行（报告的"质量退化率"诊断表需要它）。
+# 基线只统计分位数与失败数，不对 A2/A3 判定——基线是尺子的来源，
+# 再拿它判达标会形成循环论证。
+baseline_enabled = true
+# 基线并发：必须低到不触发排队/拒绝，且小于最小的 concurrency_step
+baseline_concurrency = 1
+# 基线时长：需保证每个长度桶都有足量样本（>= analysis.baseline_min_samples），
+# 否则该桶门限回退为 absolute 配置值并在报告中标注。样本不足时基线会自动延长
+# （判据：最短样本桶；上限同 max_stage_duration_s），实际时长与配置时长都会记录
+baseline_duration_s = 30.0
+baseline_warmup_s = 5.0
+
+[requests]
+# prompt 长度目标（token）分布。留空则按 max_context_tokens 自动推导
+# [ctx/64, ctx/16, ctx/4]（32768 → [512, 2048, 8192]，8K → [128, 512, 2048]）。
+# 显式配置永远优先：分布应镜像生产流量画像，而非模型能力上限——
+# 128K 模型若生产流量 90% 在 2K 以内，按上限推导会把容量拐点定位错误。
+prompt_token_targets = [512, 2048, 8192]
+# 各长度的采样权重；只配长度不配权重时按等权处理
+prompt_weights = [0.2, 0.5, 0.3]
+# 服务支持的上下文上限（prompt + output 不得超过）；从服务文档或 /v1/models 获取
+max_context_tokens = 32768
+# 输出长度（token）分布；TPOT 统计需要足够的输出 token
+output_token_choices = [128, 256]
+output_weights = [0.7, 0.3]
+temperature = 0.7
+stream = true
+# 每请求附加唯一前缀，规避前缀缓存对 TTFT 的“美化”
+unique_prefix = true
+seed = 20241030
+# 无 tokenizer 时的字符/token 估算比（中英文混合约 3.5；真实值以 usage 为准并可在报告中复盘）
+chars_per_token = 3.5
+# prompt 长度分桶上界（token，左开右闭）；桶数 = 上界个数 + 1，最后一个桶无上界。
+# 例 [1024, 4096] → ≤1024 / 1025-4096 / >4096 三桶。
+# 留空则按 max_context_tokens 自动推导 [ctx/32, ctx/8]（32768 → [1024, 4096]）。
+# 分桶的意义：TTFT 与 prompt 长度强相关（prefill 计算量近似线性），全局单门限会让
+# 长 prompt 请求天然落入 A3，把"长度差异"混进"排队劣化"里。分桶后每个桶有独立
+# 门限（baseline_relative）或统一门限（absolute），A3 归因才能回答"是所有长度都
+# 劣化，还是只有长 prompt 劣化"。
+length_buckets = [1024, 4096]
+
+[analysis]
+# ---- 人工价值目标（只作约束；SLA/SLO 的边界值由压测实测产出）----
+# 可用性目标：A2+A3 占比；0.999 即 3 个 9。仅表示"接得住"。
+# 这是价值目标而非门限来源：SLA 的边界（A1 拐点）由实测给出（报告结论
+# "实测服务等级"一节），本目标只用于筛选达标前缀。
+sla_target = 0.999
+# 质量达标率目标：A2 占比。表示"接得好"。同理，SLO 的边界（A3 拐点）
+# 由实测给出；生产并发建议以两者同时达标的"质量容量"为准。
+slo_target = 0.95
+# 样本少于此值的压力级不参与高置信度容量判定（仅作低置信度参考容量）。
+# 闭环模式下请结合 max_stage_duration_s 评估可达性：并发 1、E2E≈3.5s 时
+# 300s 约产出 85 个样本
+min_samples_per_stage = 60
+# baseline_relative 模式下每个【长度桶】各自的样本量门限（级统计量与桶统计量
+# 的判定粒度不同，故分开配置）。桶内成功样本少于此值时该桶门限回退 absolute。
+# 按 prompt 权重 [0.2, 0.5, 0.3] 反推：最短桶要 30 个样本共需 150 个总样本；
+# 基线阶段会按"最短样本桶"自适应延长，结束仍不足时给出还差多少/约需多久的提示。
+# 调大提高 p99 置信度但拉长基线时长；调小反之（会降低 p99 置信度）
+baseline_min_samples = 30
+
+[watermark]
+# 水位判定：把每级请求特征翻译成服务端水位的可观测投影（NORMAL/BUSY/OVERLOAD），
+# 详见 docs/05-watermark.md。资源级水位（KV Cache / 批 slot / GPU）是服务端内部
+# 指标，黑盒压测看不到，归服务端 Prometheus + 监控分析器；这里判定的是
+# "服务排队/拒绝"在客户端信号上的投影，供 Router 配置排队预警线与熔断线。
+enabled = true
+# 软水位（BUSY）：A3 占比达到此值即判定本级进入排队区（不拒绝但时延/质量劣化）。
+# p99 门限下正常流量 A3 应≈0；20 个请求坏 1 个已远超随机抖动
+soft_slo_violation_ratio = 0.05
+# 硬水位（OVERLOAD）：A3 占比达到此值 = 质量崩塌（过半请求不达标）
+hard_slo_violation_ratio = 0.50
+# 硬水位（OVERLOAD）：A1（含 Router 过载拒绝）占比达到此值 = 服务在拒绝接入。
+# 限流不会零星出现，1% 已是明确信号
+hard_reject_ratio = 0.01
+# 软水位附加门限：TTFT p99 超过此绝对值也判 BUSY（在 A3 尚少时提前预警排队）。
+# 0 = 关闭（只用违约率判据，不引入第二套绝对尺子）；跨引擎对比时记得调整
+soft_ttft_p99_ms = 0.0
+
+[qos_model]
+# 服务质量预测模型：压测采样（不同并发 × 不同请求长度）同时用作训练数据，
+# 训练一个多层感知机（MLP），输入并发/prompt 长度/输出长度，预测 TTFT/TPOT。
+# 方法论与统计纪律（按 stage 分组交叉验证、残差 ECDF 校准、包络守卫）
+# 详见 docs/06-qos-model.md。纯 Python 标准库实现，无第三方依赖。
+enabled = true
+# 入训样本：非预热的 measured 请求；A3（超门限）必须保留——容量膝点区只有 A3 样本。
+# warmup / aborted / A1 失败样本剔除（A1 通常伴随超时截断，时延畸变）
+# 最低训练样本量：低于此值模型不可信，宁可不训（报告会说明跳过原因）
+min_samples = 200
+# 隐藏层宽度。小数据下更大网络只会过拟合；拟合不足时可先加样本再加宽
+hidden = [12, 12]
+# 训练参数：全批量 Adam，MSE 损失（log 空间）。epochs 受 max_train_seconds 截断
+epochs = 120
+learning_rate = 0.01
+# 交叉验证折数：按 stage 分组（同级样本共享并发特征，随机划分会泄漏导致指标虚高）；
+# stage 数不足时自动降级并标注"无有效验证"
+val_folds = 4
+# 验证 R² 下限：任一目标低于此值，报告只渲染数据口径、不给预测结论
+min_r2 = 0.5
+# 单级样本封顶（按 stage 分层抽样）：控制纯 Python 训练时长
+max_samples = 4000
+# 训练时长硬预算（秒）：超时即用已训轮次，保证压测总时长可控。
+# 参考基准（本机）：4000 样本 + [12,12] 全量交叉验证 + 终训 ≈ 95s
+# （float 字段，写 150 或 150.0 均可）
+max_train_seconds = 150.0
+# 模型文件：.npz（ZIP + .npy 容器），可被 numpy 生态 np.load() 直接消费。
+# --report-only 时若文件存在则直接加载重算，不存在则按当前配置重训
+save_path = "results/qos_model.npz"
+
+[storage]
+# 留空则自动生成 results/bench_<时间戳>.db
+db_path = ""
+
+[report]
+# 留空则自动生成 results/report_<时间戳>.md
+output_path = ""

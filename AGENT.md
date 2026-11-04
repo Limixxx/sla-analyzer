@@ -33,13 +33,13 @@
 5. **时延口径**：一律 `time.monotonic()`；TTFT/E2E 为客户端视角（从建连前起算），
    `connect_ms` 单列可扣减；`sent_at` 取**发出时刻**，不取发现/取消时刻。
 6. **隐私**：`requests` 表只存特征（长度、时延、分类、错误类型），**不存 prompt 与响应正文**。
-7. **方法论决策 D1–D21**（`docs/00-overview.md`）：改动任何判定/分类/统计逻辑前必读对应章节；
+7. **方法论决策 D1–D25**（`docs/00-overview.md`）：改动任何判定/分类/统计逻辑前必读对应章节；
    推翻某条决策要在 `docs/00-overview.md` 的决策表和修订记录里落地，不能只改代码。
 
 ## 2. 阅读顺序
 
 1. `README.md` —— 指标定义、目录结构、快速开始、配置表、局限。
-2. `docs/00-overview.md` —— 文档地图 + D1–D21 决策表 + 一页总览图。
+2. `docs/00-overview.md` —— 文档地图 + D1–D25 决策表 + 一页总览图。
 3. 按需：`01 指标体系`（A1/A2/A3、SLA/SLO、TTFT/TPOT）、`02 容量模型`（两阶段过载、连续前缀）、
    `03 门限定标`（基线、长度分桶、退化率）、`04 测量有效性`（偏差 B1–B9）、
    `05 水位语义`（NORMAL/BUSY/OVERLOAD 投影）、`06 预测模型`（MLP、分组 CV、残差 ECDF、包络）。
@@ -77,8 +77,8 @@ config.toml/.json → config.py(Config dataclass + 长度自动推导 + validate
 | `bench/qos.py` `mlp.py` `npz.py` | 数据集、训练协议、校准、仿真、`.npz` 落盘 | A3 必须入训（D16）；按 stage 分组 CV；`.npz` 需与 `np.load()` 互通 |
 | `bench/report.py` | 结论、建议、各级表格、预测章节 | 结论口径与 `metrics.find_capacity` 的 notes 全量渲染，不得吞掉提示 |
 | `bench/format.py` | 两套报告共享的 Markdown 格式化原语（表格/百分比/毫秒） | 在线报告的输出由 golden 测试字节锁定，改原语先跑 `tests/test_isolation.py` |
-| `bench/report_batch.py` | 容量/批量场景：吞吐报告渲染 + 容量面汇写 | 容量读数取峰值口径（D21）；膝点证据与 A1 归因家族渲染；不得 import 进在线路径 |
-| `bench/throughput.py` | 容量面 fit/merge/query/save/load（表格+插值，不训练） | replace-per-L 合并；不同 base_url 拒绝混装；token 缺失存 NaN 读回 None |
+| `bench/report_batch.py` | 容量/批量场景：吞吐报告渲染 + 容量面汇写 | 容量读数取峰值口径（D21）；无膝点走平台第二读数（D23 `plateau_reading`）；数据质量闸门（D24）与 `_run_io_len` 坐标判定仅吞吐路径可调（R4）；超时预算同印（D25）；不得 import 进在线路径 |
+| `bench/throughput.py` | 容量面 fit/merge/query/save/load（`(L_in, L_out)` 二维表格 + 双线性插值，不训练，D22） | replace-per-cell 合并；不同 base_url 拒绝混装；旧一维面守卫读回（`output_len=0, origin=knee`）；token 缺失存 NaN 读回 None |
 | `mock_server.py` | 本地模拟两阶段过载（soft 排队 / hard 拒绝） | 只用于自测，不进生产结论 |
 
 ## 4. 常见任务的改动清单
@@ -106,7 +106,7 @@ config.toml/.json → config.py(Config dataclass + 长度自动推导 + validate
 
 ```bash
 cd <本目录>
-# 1) 测试套件（约 25 秒）：单元 + 隔离 + mock E2E，纯标准库 unittest，无需 pytest
+# 1) 测试套件（约 80 秒，含两个 mock E2E 场景）：单元 + 隔离 + mock E2E，纯标准库 unittest，无需 pytest
 python -m unittest discover -s tests
 # 只跑某个文件：python -m unittest tests.test_metrics_throughput -v
 
@@ -126,11 +126,14 @@ python bench.py --config config/config.mock-demo.toml --report-only \
     --db results/tmp_check.db --report results/tmp_check2.md
 ```
 
-测试套件构成（`tests/`，70 例）：吞吐聚合与 `a1_onset`、store 新旧库迁移与
-守卫读回、批量配置校验、吞吐报告渲染、容量面 fit/query/save/load、
-隔离规则（AST 扫描共享模块禁 import 容量模块 + `tests/golden/online_report.md`
-字节锁定默认在线报告输出）、mock E2E（一次运行两份报告 + 容量面、
-`--report-only` 同 SLA、默认 kinds 只出在线报告、`--capacity-plan` 反查）。
+测试套件构成（`tests/`，101 例）：吞吐聚合与 `a1_onset`、store 新旧库迁移与
+守卫读回、批量配置校验、吞吐报告渲染（膝点读数 D21 / 平台读数 D23 / 质量闸门
+D24 / 超时同印 D25）、容量面 2D 坐标（`output_len` 往返、双线性插值、clamp/
+最近点回退、replace-per-cell 合并、旧一维面守卫读回）、隔离规则（AST 扫描共享
+模块禁 import 容量模块 + `tests/golden/online_report.md` 字节锁定默认在线报告
+输出）、mock E2E（一次运行两份报告 + 容量面、`--report-only` 同 SLA、默认 kinds
+只出在线报告、`--capacity-plan` 反查含 `--output-len`、软退化无限队列双运行
+→ 平台读数入面 → 二维反查）。
 golden 需要随**有意**的在线报告变更重生成时：`SLA_TEST_REGEN_GOLDEN=1 python -m
 unittest tests.test_isolation`；默认运行下任何字节差即失败。
 
@@ -162,35 +165,40 @@ TTFT≈230ms / TPOT≈21ms / E2E≈1.5s；上面的快速自测约 55 秒跑完�
   收尾时清理自己创建的，**别人创建的先问再删**。
 - Windows 下会打印 `LF will be replaced by CRLF` 警告，属正常噪音，不影响运行；提交前用 `git status`
   确认只包含预期文件。
-- 本目录处于**活跃并发编辑**中：当前工作区有批量/容量增强（[07](docs/07-overall-design.md) §7.10）的
-  未提交改动——修改 `bench.py`、`bench/config.py`、`bench/metrics.py`、`bench/report.py`、
-  `bench/store.py` 与 `docs/00`、`docs/01`、`docs/07`，新增 `bench/format.py`、
-  `bench/report_batch.py`、`bench/throughput.py`、`config/`（含 `config.throughput.toml`，
-  原根目录 `config.mock-*.toml` 移入）与 `tests/`。动手前必须先 `git status --short`
+- 本目录处于**活跃并发编辑**中：当前工作区有输出长度优化议题（D22–D25，
+  `docs/issue/issue-batch-output-len-optimization.md`）的未提交改动——修改
+  `bench.py`、`bench/report_batch.py`、`bench/throughput.py`、`tests/`（helpers
+  与三个测试文件）、`config/config.throughput.toml` 注释与 `docs/00`、`docs/07`、
+  `README.md`、`AGENT.md`、issue 文档落地状态。动手前必须先 `git status --short`
   + `git diff` 重新核实现状，基于工作区内容做增量编辑，不要整体重写这些文件，
   也不要按本文件第 8 节的快照直接下结论。
 
 ## 8. 进行中的特性快照（2026-11-03，接手前重新核实）
 
-主题：**批量/容量场景：一次采集、两套分析**——设计定稿见
-[docs/07-overall-design.md](docs/07-overall-design.md) §7.10，本快照描述其落地状态。
-上一个快照的主题（无限队列部署下的过载识别）已落地提交，配套文档缺口已补齐。
+主题：**批量场景输出长度优化（D22–D25）**——议题依据
+`docs/issue/issue-batch-output-len-optimization.md`，设计落点
+[docs/07-overall-design.md](docs/07-overall-design.md) §7.10（v1.1 段）。
+上一个快照的主题（批量/容量场景：一次采集、两套分析，D19–D21）已落地提交
+（`f9d860c`）。
 
-- **已落地（随本次变更提交）**：`ok_rps`/`input_tps` 两个聚合字段与 `stages`
-  两列（可空、旧库守卫读回）、`find_service_levels(..., a1_onset=True)` 可选
-  参数（默认 False，在线行为不变）、`report.kinds` 与窗口承诺配置
-  （`analysis.window_requests` / `window_hours` / `window_safety_factor`）、
-  `bench/format.py`（两套报告共享的格式化原语）、`bench/report_batch.py`
-  （吞吐报告 + 容量面汇写）、`bench/throughput.py`（容量面 fit/query/save/load）、
-  `config.throughput.toml` 预设、`--throughput-model` / `--capacity-plan` /
-  `--target-rpm` / `--input-len` flag、`tests/` 70 例测试套件（§5 闸门 #1）。
-- **实现口径修正（E2E 逼出，已入文档 D21 与 07 §7.10.3/§7.10.5）**：容量读数
-  取膝点级及低压各级 `ok_rps` 的峰值所在级（硬拒绝型坍塌时不把坍塌值当容量，
-  结论中显式说明）；`req_conc` 记录取得峰值吞吐的负载水平，`--capacity-plan`
-  输出的"所需并发"是参考并发。
-- **在线路径零影响已锁定**：默认 `report.kinds=["online"]` 的输出与增强前
-  逐字节一致，由 `tests/test_isolation.py` 的 golden 文件断言；共享模块
-  （runner/client/metrics/store）禁 import 容量模块，由 AST 扫描断言。
+- **已落地（随本次变更提交）**：容量面坐标升为 `(L_in, L_out)` 二维——
+  `ThroughputPoint.output_len`/`origin` 字段、`query` 双线性插值 + 包络
+  clamp + 最近点回退、merge 按 cell 覆盖、旧一维面守卫读回、
+  `--capacity-plan --output-len` flag（D22）；软退化平台第二读数
+  `plateau_reading`（无膝点时"范围内饱和读数"入面，`origin=plateau`，
+  D23）；数据质量闸门 `_validate_stage_consistency`（Little's Law + 时延
+  恒等式，仅吞吐路径、只警告不阻断，D24）；吞吐报告头超时预算行 +
+  `--capacity-plan` 读数来源同印（D25）；`config.throughput.toml` 注释更新；
+  `tests/` 70 → 101 例（§5 闸门 #1，全绿）。
+- **隔离纪律（R1–R4）验证通过**：在线逻辑零改动——golden
+  `online_report.md` 字节锁定测试通过（R2）；共享模块 AST 扫描通过（R1/R3）；
+  新增批量逻辑（坐标判定/平台判定/质量闸门）仅由 `report.kinds` 含
+  `throughput` 的路径调用（R4，含软退化 mock E2E 断言 kinds=["throughput"]
+  不产在线报告）。
+- **后续未决（issue §7）**：`plateau_margin`（5%）阈值待真实负载经验校准、
+  最小梯度档建议（≥ 末级并发 25%）；角点稀疏时建议按四角点铺床；输出长度
+  目标档 vs 实测均值（`max_tokens` 非保证）的显式记录方式；模型间不可迁移
+  的 base_url 分文件粒度维持不变。
 
 ## 9. 与用户协作
 

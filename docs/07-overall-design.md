@@ -658,14 +658,29 @@ input 与 output 都是一等基础数据（预填充与解码两侧的容量归
 （`report_batch.capacity_stage`）：理想膝点处二者一致；坍塌时取低压峰值，
 并在结论中显式说明（"容量读数 @ 负载 X，膝点级 ok_rps 已受过载回落"），
 不把坍塌值当成容量。容量面 `req_conc` 与读数级同源（§7.10.5）。
+
+**软退化服务的平台期第二读数（D23）**：服务端队列无限吸收（超时族主导）
+时全程无 A1、`knee=None`——但这不等于"未饱和"。**吞吐走平 + 延迟爆炸**
+正是排队型饱和的标准形态（RPS 边际增幅趋零、TPOT 走平、绝对延迟仍在上
+升）。`report_batch.plateau_reading` 在无膝点时做平台判定：峰值位于梯度
+上限、末级边际 `ok_rps` 增幅 < `plateau_margin`（默认 5%）、且末级不低于
+峰值 5% 差值带（噪声容忍）三条同时成立 → 结论给**"范围内饱和读数" =
+峰值 `ok_rps`×60**，明确标注**非膝点、软退化平台估计**，并入容量面
+（`a1_family=none, origin=plateau`）；判定不成立（仍在爬升 / 可疑回落 /
+不足两级）时维持"未确定容量膝点"的诚实降级，并附排除理由。该读数只对
+已测负载范围有效——梯度过粗会伪造"未饱和"（两级间距应 ≥ 末级并发的
+25% 量级），与 D21 峰值口径互不冲突（D21 针对有膝点的峰值所在级）。
+
 三条纪律：
 
-1. **条件性**：μ 是（负载水平，输入长度）的函数，每个吞吐数字必须带负载
-   坐标；报告以容量表逐级呈现，不做单一标量结论。
+1. **条件性**：μ 是（输入长度, 输出长度）的函数（D22 二维坐标），且是
+   客户端超时预算的函数（D25）——每个吞吐数字必须带坐标与预算同印；
+   报告以容量表逐级呈现，不做单一标量结论。
 2. **窗口承诺**：人工价值目标的形式从"几个 9"变为窗口承诺
    （`analysis.window_requests` / `window_hours`，0 = 不设）：24h 内
    100 万请求 → 反推 μ ≥ 694 RPM，加安全余量得验收线；TPS 侧由 token
-   预算（请求数 × (L+M̄)）同理折算。
+   预算（请求数 × (L+M̄)）同理折算（需单 `(L_in, L_out)` 坐标，混合档
+   显式说明未执行而非静默跳过）。
 3. **诚实退化**：TPS 的完整性取决于服务端 usage 上报；`token_source`
    显示缺失时报告降级为 RPM 单口径并标注 token 覆盖率，不静默填 0。
 
@@ -687,20 +702,22 @@ Phase 0 基线不进入容量分析（容量承诺是绝对值，相对基线尺
 
 ### 7.10.5 容量面模型：`throughput_model.npz`
 
-膝点只是本次运行的一个**点**；容量规划要反问题："扛 X RPM @ 长度 L 需要
-多少并发？"把多次容量运行（每次一个固定长度）的膝点汇成容量面并持久化：
+膝点/平台读数只是本次运行的一个**点**；容量规划要反问题："扛 X RPM @
+(L_in, L_out) 需要多少并发？"把多次容量运行（每次一个固定 `(L_in, L_out)`
+组合，D22）的读数汇成容量面并持久化：
 
 | 方面 | 设计 |
 | --- | --- |
 | 与在线模型的分工 | `qos_model.npz` 预测**没测过的负载点的质量**（MLP，[06](06-qos-model.md)）；`throughput_model.npz` 回答**容量规划反问题**（表格 + 插值，不训练） |
-| Schema | `lengths`/`mu_rpm`/`mu_tps`/`input_tps`/`output_tps`/`req_conc`/`n_samples`/`a1_family`（均 (n,) 数组）+ `meta_json`（kind、base_url、生成时刻、每点配置摘要、token 覆盖率） |
-| `req_conc` 语义 | 该长度处**取得峰值吞吐的负载水平**（闭环运行即并发数），与容量读数级同源（§7.10.3 峰值口径）；`--capacity-plan` 输出的"所需并发"是**参考并发**（该长度处取得峰值时的负载水平），不是精确最优解——反问题问"扛得住要多少"，v1 由既有测量点直接回答，不做事后优化 |
+| Schema | `lengths`/`mu_rpm`/`mu_tps`/`input_tps`/`output_tps`/`req_conc`/`n_samples`/`a1_family`（均 (n,) 数组）+ `output_lens`/`origins`（D22/D23 增量，旧一维面守卫读回为 `output_len=0, origin=knee`）+ `meta_json`（kind、base_url、生成时刻、每点配置摘要、token 覆盖率、origin 标签表） |
+| 坐标 | `(input_len, output_len)` 二维：输出长度是容量主控变量（同部署同并发 RPM 差可达 3×），必须进坐标而非"每次运行钉死常量"；**仅单 `(L_in, L_out)` 组合的运行可入面**（`_run_io_len`），混合档位诚实降级——不用混合分布冒充定点测量 |
+| `req_conc` 语义 | 该坐标处**取得峰值吞吐的负载水平**（闭环运行即并发数），与容量读数级同源（§7.10.3 峰值/平台口径）；`--capacity-plan` 输出的"所需并发"是**参考并发**，不是精确最优解——反问题问"扛得住要多少"，v1 由既有测量点直接回答，不做事后优化 |
 | 载体 | `npz.py` 零改动（纯机制，`meta_json` 走 bytes 通道与在线同款） |
 | 写入 | 报告期由 `report_batch.py` 汇写（派生量不落库，C3）；`--report-only` 可从库重建；路径经 `--throughput-model` 指定 |
-| 合并 | 同一文件内按 L 覆盖更新（replace-per-L），meta 记录来源运行；不同边界/配置的面对比用两个文件，不混装 |
-| 查询 | `--capacity-plan <npz> --target-rpm X --input-len L`（平行于 `--qos-predict`）：输出该 L 处预测 μ（RPM/TPS 分解）、所需并发、余量；L 超出测量范围时 clamp 到端点并标 `extrapolated`（对应在线模型的包络守卫角色） |
+| 合并 | 同一文件内按 `(L_in, L_out)` 单元格覆盖更新（replace-per-cell），不同 cell 共存（换输出档位的两次运行在同一张面上各占一列）；meta 记录来源运行；不同边界/配置的面对比用两个文件，不混装 |
+| 查询 | `--capacity-plan <npz> --target-rpm X --input-len L [--output-len M]`（平行于 `--qos-predict`）：输出该坐标处预测 μ（RPM/TPS 分解）、所需并发、余量与**读数来源**（膝点实测 / 软退化平台估计，D25）。二维面用双线性插值；缺省 `--output-len` 时取最小输出档作答并提示显式指定；任一坐标超出测量范围 clamp 到端点并标 `extrapolated`；角点未实测时回退最近实测点并显式说明（建议按四角点铺床）——均不静默（D16 包络守卫同款思路） |
 | 使用 | ① 容量规划反查 ② CI 门禁工件（用绝对验收线，不用插值面）③ 多长度/多配置运行的容量汇总与趋势 ④ 二期运行护栏（实测 `ok_rps` 持续低于预测 μ×安全系数时早警） |
-| 不上 MLP 的理由 | v1 的反问题由 `req_conc` 曲线直接回答；2-D 面 μ(c,L) 是优化视角、收益递减，列为二期可选（届时复用 `mlp.py` 方法论，换 `FEATURES`/`TARGETS` 定义） |
+| 不上 MLP 的理由 | v1 的反问题由 `req_conc` 曲线直接回答；(L_in, L_out) 二维网格仍是表格 + 双线性插值（同构于原 1D，不训练）；收益递减，MLP 列为可选（届时复用 `mlp.py` 方法论，换 `FEATURES`/`TARGETS` 定义） |
 
 ### 7.10.6 吞吐报告：`report_batch.py`
 
@@ -709,12 +726,12 @@ Phase 0 基线不进入容量分析（容量承诺是绝对值，相对基线尺
 
 | 章 | 内容 | 计算位置 |
 | --- | --- | --- |
-| 〇、头部 | 边界行（base_url + 运行时刻 + 配置快照摘要） | 配置与 meta |
-| 一、结论 | SLA(RPM\*)/SLO(全量 TPS\*) vs 窗口承诺验收线；达标判定；input/output 分解的瓶颈判读 | 报告期现算 |
-| 二、容量表 | 每级负载水平 → ok_rps/total_tps/input_tps/output_tps/A1 占比/样本数；`rps` 全量列单独标注 | StageStats 现列 |
-| 三、膝点证据 | 首个 A1 级（`a1_onset`）+ 平台佐证（连续两级 `ok_rps` 增幅 <5%） | 报告期现算 |
+| 〇、头部 | 边界行（base_url + 运行时刻 + 配置快照摘要）+ **超时预算行**（D25：`service.timeout_s` 与"膝点 = 服务拒绝或客户放弃"同印） | 配置与 meta |
+| 一、结论 | SLA(RPM\*)/SLO(全量 TPS\*) vs 窗口承诺验收线；达标判定；input/output 分解的瓶颈判读；无膝点时按 D23 走平台分支（"范围内饱和读数"或诚实降级 + 排除理由） | 报告期现算 |
+| 二、容量表 | 每级负载水平 → ok_rps/total_tps/input_tps/output_tps/A1 占比/样本数；`rps` 全量列单独标注；表后附**数据质量诊断行**（D24：Little's Law + 时延恒等式，仅警告不阻断） | StageStats 现列 + 请求明细 |
+| 三、膝点证据 | 首个 A1 级（`a1_onset`）+ 平台佐证（连续两级 `ok_rps` 增幅 <5%）；无膝点时改列**平台判定证据**（末级边际增幅、差值带核对） | 报告期现算 |
 | 四、A1 归因 | `error_kind`/`fail_kinds` 家族拆分（D17） | 现成机制 |
-| 五、建议 | 扩容 / 负载调参 / 窗口重谈，按归因分化 | Finding + stages |
+| 五、建议 | 扩容 / 负载调参 / 窗口重谈，按归因分化；软退化形态追加"治理入口在客户端超时与背压（D25）"与梯度加细建议 | Finding + stages |
 
 ```
 c* = findings.availability_boundary            # a1_onset=True（首个 A1 级）
@@ -722,6 +739,11 @@ cap = capacity_stage(stages, c*)                # 膝点级及低压各级 ok_rp
 SLA = cap.ok_rps × 60                           # RPM
 SLO = cap.input_tps + cap.output_tps            # 全量 TPS
 判定 = SLA ≥ window_requests/(window_hours×60) × safety_factor
+
+# knee is None（全程无 A1，软退化）时的平台分支（D23）：
+peak = plateau_reading(stages, margin=5%)       # 峰值在梯度上限 + 末级边际 <5% + 差值带
+SLA = peak.ok_rps × 60                          # 非膝点：范围内饱和读数，报告明确标注
+容量面坐标 = (input_len, output_len)，origin="plateau", a1_family="none"
 ```
 
 ### 7.10.7 架构决策与隔离规则（已定，不再复议）
@@ -729,7 +751,7 @@ SLO = cap.input_tps + cap.output_tps            # 全量 TPS
 **决策：单一采集管道 + 可插拔分析/渲染**。曾评估"入口两模式"方案：此时
 要分离的只剩两个模块，隔离收益趋零；而共享收益——一份 runner/metrics/
 store、同库两种分析、`--report-only` 事后补报告——无法通过复制取得。
-三条隔离规则：
+四条隔离规则（R4 为 v9 议题落地时新增）：
 
 1. **无场景分支**：`runner.py`/`client.py`/`metrics.py`/`store.py` 禁止
    出现场景判断；差异只经配置（长度档 / `mode` / `report.kinds` /
@@ -741,6 +763,11 @@ store、同库两种分析、`--report-only` 事后补报告——无法通过�
 3. **窄接口**：渲染器接口 = `(cfg, store, stats, findings, meta) → 报告
    路径`，与 `write_report` 同形；容量面接口 = `fit(points) → 面` /
    `query(面, 目标) → 答案 + 外插标记`。
+4. **批量专属逻辑独占调用（R4，D22–D24 的隔离纪律）**：新增的坐标判定
+   （`_run_io_len`）、质量闸门（`_validate_stage_consistency`）、平台判定
+   （`plateau_reading`）只能被 `report.kinds` 含 `throughput` 的路径调用；
+   `--report-only` 重建在线报告时不得触发任何批量逻辑（golden 字节锁定 +
+   AST import 方向扫描双守护）。
 
 **在线路径零影响（硬约束）**：本增强只允许加字段、加列、加模块、加 flag。
 默认配置（`report.kinds=["online"]`）的输出与增强前逐字节一致，由回归
@@ -760,6 +787,15 @@ store、同库两种分析、`--report-only` 事后补报告——无法通过�
 config.throughput.toml` 一条命令产出含边界行、每级 SLA/SLO、容量表、
 膝点证据与达标判定的吞吐报告并落盘容量面；`--capacity-plan` 可对任意
 （目标 RPM，长度）反查所需并发。合计 4.5-6 人天。
+
+v1.1（D22–D25，议题 `docs/issue/issue-batch-output-len-optimization.md`
+落地）已完成：容量面二维坐标 + 双线性查询（方案 A）、软退化平台第二读数
+（方案 B）、数据质量闸门（方案 C）、超时预算同印（方案 D）；验证按该议题
+§6 执行——既有套件作回归闸门（golden 在线报告字节锁定验证 R2）、新增
+单元测试与软退化 mock E2E（多 `(L_in, L_out)` 运行 → 2D 写点 → 带
+`--output-len` 反查 → 平台标注与 timeout 同印）、隔离验证（默认
+`kinds=["online"]` 的 `--report-only` 不触发任何批量逻辑，AST 扫描 +
+行为断言）。套件规模 70 → 101 例，全绿。
 
 ## 7.11 实现映射
 
@@ -783,8 +819,12 @@ config.throughput.toml` 一条命令产出含边界行、每级 SLA/SLO、容量
 | 长度参数推导 | `bench/config.py::_resolve_length_defaults` |
 | 吞吐侧聚合字段 | `bench/metrics.py::compute_stage_stats`（+`ok_rps`/`input_tps`） |
 | 容量膝点（首个 A1） | `bench/metrics.py::find_service_levels`（`a1_onset=True`，默认 False） |
-| 容量面构建/查询 | `bench/throughput.py`（fit/query/save/load，经 `npz.py`） |
+| 容量面构建/查询 | `bench/throughput.py`（fit/query/save/load，经 `npz.py`；`query` 双线性插值 + 包络 clamp + 最近点回退，D22） |
+| 容量面坐标判定 | `bench/report_batch.py::_run_io_len`（单 `(L_in, L_out)` 组合才入面，D22） |
+| 平台期第二读数 | `bench/report_batch.py::plateau_reading / plateau_point`（D23） |
+| 数据质量闸门 | `bench/report_batch.py::_validate_stage_consistency`（Little's Law + 时延恒等式，D24，仅吞吐路径） |
 | 吞吐报告 | `bench/report_batch.py`（格式化原语抽自 `report.py`） |
+| 容量规划反查 | `bench.py::_capacity_plan`（`--target-rpm/--input-len/--output-len`，读数来源与超时预算同印，D25） |
 | 报告选择 | `bench/config.py`（`report.kinds`）+ `bench.py` 组合层 |
 | 容量存储增量 | `bench/store.py`（`stages.ok_rps`/`stages.input_tps` 两列 + 守卫读回） |
 

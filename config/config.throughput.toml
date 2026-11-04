@@ -7,13 +7,14 @@
 #
 #   # 容量规划反查（无需重跑压测）：
 #   python bench.py --capacity-plan results/throughput_model.npz \
-#       --target-rpm 500 --input-len 4096
+#       --target-rpm 500 --input-len 4096 --output-len 512
 #
 # 设计要点（与在线场景共用同一条测量管道，差异只在配置与 report.kinds）：
 # - 负载单位是请求（RPS/并发），与在线场景同一口径；批量作业（job）不是
 #   负载单位，不进入本工具（§7.10.1）。
-# - 批内固定长度：单长度档 + 单长度桶，长度从"分桶统计维度"变为"运行坐标"，
-#   多长度对比靠多次运行汇入同一张容量面（按 L 覆盖更新）。
+# - 批内定长：输入/输出各单档 + 单长度桶，长度从"分桶统计维度"变为
+#   "运行坐标" (L_in, L_out)（D22）；多组合对比靠多次运行汇入同一张容量面
+#   （按 (L_in, L_out) 单元格覆盖更新）。混合档位运行不入容量面（不猜坐标）。
 # - 容量场景不关心延迟：A3 照常采集（成本为零）但吞吐报告不引用；这里把
 #   Phase 0 基线关掉（load.baseline_enabled=false）省时——少跑低压级，
 #   不少采任何事实；此时按项目规则必须显式 target_mode="absolute"
@@ -52,7 +53,9 @@ baseline_enabled = false
 
 [requests]
 max_context_tokens = 8192
-# 固定长度：单档 + 等权，输出长度同样固定——批量场景批内通常是定长
+# 定长运行（D22）：输入/输出各单档 + 等权——(L_in, L_out) 即容量面坐标。
+# 要铺二维网格就改这两个档位分多次运行（建议先跑四角点），不同单元格
+# 在面内共存；本文件保持单档，单次运行产生一个 cell
 prompt_token_targets = [4096]
 prompt_weights = [1.0]
 output_token_choices = [512]
@@ -85,7 +88,7 @@ db_path = "results/capacity.db"
 # 只要 online 也能单独跑（默认）；只要吞吐则写 kinds = ["throughput"]。
 kinds = ["online", "throughput"]
 output_path = "results/capacity.md"          # 在线报告；吞吐报告自动加 _throughput 后缀
-throughput_model_path = "results/throughput_model.npz"   # 容量面（按 L 覆盖更新）
+throughput_model_path = "results/throughput_model.npz"   # 容量面（按 (L_in, L_out) 单元格覆盖更新）
 
 [qos_model]
 # 容量场景不关心质量预测：关掉 MLP 训练省时（在线报告会注明"模型未生成"）。

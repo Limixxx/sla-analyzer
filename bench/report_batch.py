@@ -8,8 +8,10 @@
   SLO = 膝点 ``input_tps+output_tps``（全量 TPS，目标/工作量），同在
   A1 拐点（``find_service_levels(..., a1_onset=True)``，§7.10.3）；
 - 容量分析不消费质量维度：A3 照常被采集与计数，但本报告不引用；
-- 报告期汇写容量面 ``throughput_model.npz``（派生量不落库，C3），
-  使 ``--report-only`` 可从旧库重建出同一结论。
+- 软退化（全程无 A1）服务以平台期第二读数收场（D23，§7.10.3）；
+- 报告期执行两道数据质量闸门（D24）并汇写容量面 ``throughput_model.npz``
+  （坐标为 (L_in, L_out) 单元格，D22；派生量不落库，C3），使
+  ``--report-only`` 可从旧库重建出同一结论。
 
 依赖方向（§7.10.7 隔离规则）：本模块 import 在线侧数据结构
 （metrics/format/store）与吞吐模块（throughput）；在线侧模块零容量
@@ -38,6 +40,11 @@ from .throughput import (
 # （§7.10.6）。增幅 ∈ [0, 5%) 为趋平（饱和形态），< 0 为回落（已过膝点坍塌），
 # 两者都佐证膝点，但成因不同，报告中分开标注。
 _PLATEAU_GROWTH = 0.05
+
+# 数据质量闸门（D24）容差与最少样本：偏差超容差记诊断行（只警告不阻断）；
+# 样本过少时不判读——小样本均值残差噪声大，喊出来反而误导。
+_CONSISTENCY_TOL = 0.15
+_MIN_DIAG_SAMPLES = 5
 
 
 # ---------------------------------------------------------------------- #
@@ -76,16 +83,18 @@ def _dominant_family(stats: StageStats) -> str:
     return "other"
 
 
-def _run_input_len(cfg: Config, knee: StageStats) -> Optional[int]:
-    """本次运行的输入长度坐标：仅单长度配置可取（配置值本身）。
+def _run_io_len(cfg: Config) -> Optional[Tuple[int, int]]:
+    """本次运行的 (输入, 输出) 长度坐标：仅单组合配置可取（D22）。
 
-    容量面按长度索引且每个点应为"固定长度运行"的膝点（§7.10.5）；
-    混合长度运行的膝点不对应单一 L，用均值近似会让插值面失真，
-    因此不猜坐标——返回 None，由调用方跳过容量面写入并说明原因。
+    容量面按 (L_in, L_out) 单元格索引且每个点应为"定长运行"的读数
+    （§7.10.5）；混合输入档或混合输出档的运行不对应单一 cell，用均值
+    近似会让插值面失真，因此不猜坐标——返回 None，由调用方跳过容量面
+    写入并说明原因（D21"定点测量"纪律在二维下的推广）。
     """
-    targets = list(cfg.requests.prompt_token_targets)
-    if len(targets) == 1:
-        return int(targets[0])
+    ins = list(cfg.requests.prompt_token_targets)
+    outs = list(cfg.requests.output_token_choices)
+    if len(ins) == 1 and len(outs) == 1:
+        return int(ins[0]), int(outs[0])
     return None
 
 
@@ -113,14 +122,17 @@ def knee_point(
     """由膝点构造容量面事实点（token 侧可缺，缺则不编造）。
 
     mu 取容量读数级（峰值 ok_rps），req_conc 取同一负载水平（取得峰值的
-    并发/在途数），n_samples 取容量读数级样本数。膝点（开始出现失败的
-    负载水平）见报告第三节，不入容量面——反问题问的是"扛得住要多少"。
+    并发/在途数），n_samples 取容量读数级样本数，坐标取本次运行的
+    (L_in, L_out) 组合（_run_io_len，混合档位返回 None 不入面）。膝点
+    （开始出现失败的负载水平）见报告第三节，不入容量面——反问题问的
+    是"扛得住要多少"。
     """
-    input_len = _run_input_len(cfg, knee)
-    if input_len is None or cap.ok_rps is None:
+    io = _run_io_len(cfg)
+    if io is None or cap.ok_rps is None:
         return None
     return ThroughputPoint(
-        input_len=input_len,
+        input_len=io[0],
+        output_len=io[1],
         mu_rpm=cap.ok_rps * 60.0,
         mu_tps=cap.total_tps,
         input_tps=cap.input_tps,
@@ -129,6 +141,79 @@ def knee_point(
         n_samples=cap.n_total,
         a1_family=_dominant_family(knee),
         source=source,
+        origin="knee",
+    )
+
+
+def plateau_reading(
+    stages: Sequence[StageStats], margin: float = _PLATEAU_GROWTH
+) -> Tuple[Optional[StageStats], List[str]]:
+    """软退化（全程无 A1）服务的平台期第二读数（D23，§7.10.3）。
+
+    判据（两条同时满足才给读数）：
+    - 末级边际增幅 < margin（吞吐走平）；
+    - 末级 ok_rps 不低于全程峰值的 (1 - margin)（顶部平坦——用"差值带"
+      而非"峰值必须落在末级"判定，容忍测量噪声把峰值推到倒数第二级）。
+
+    满足 → 返回峰值级作为"范围内饱和读数"；不满足 → 返回 None 并说明
+    卡在哪条判据上（仍在爬升 / 回落可疑形态 / 样本不足以判读）。该读数
+    **非膝点**：服务不拒绝、只变慢，峰值 ok_rps 是梯度范围内的饱和平台
+    估计，只对已测负载范围与当次超时预算有效（D25）。
+    """
+    ordered = sorted(
+        (s for s in stages if s.n_total > 0 and s.ok_rps is not None),
+        key=lambda s: s.concurrency,
+    )
+    if len(ordered) < 2:
+        return None, ["带有效完成速率的压力级不足两级，无法判读平台形态。"]
+    last, prev = ordered[-1], ordered[-2]
+    peak = max(ordered, key=lambda s: (s.ok_rps, -s.concurrency))
+    growth = (last.ok_rps - prev.ok_rps) / prev.ok_rps if prev.ok_rps > 0 else 1.0
+    if growth >= margin:
+        return None, [
+            f"末级（负载 {last.concurrency}）边际增幅 {growth:+.1%} ≥ {margin:.0%}，"
+            "吞吐仍在爬升：范围内未饱和，不给平台读数。"
+        ]
+    if last.ok_rps < peak.ok_rps * (1.0 - margin):
+        return None, [
+            f"末级（负载 {last.concurrency}）ok_rps 已较峰值回落超过 {margin:.0%}"
+            f"（{last.ok_rps:.2f} vs 峰值 {peak.ok_rps:.2f} rps）且全程无 A1："
+            "吞吐回落而无失败属可疑形态（疑似计时污染或外部干扰），建议复测核实，"
+            "不给平台读数。"
+        ]
+    return peak, [
+        f"负载 {last.concurrency} 之上全程未出现 A1 且吞吐已走平"
+        f"（末级边际 {growth:+.1%} < {margin:.0%}，峰值与末级差 ≤ {margin:.0%}）："
+        f"软退化平台形态。范围内饱和读数取峰值级 负载 {peak.concurrency} 的 "
+        f"ok_rps×60——**非膝点读数**，是排队型服务的平台估计，只对已测负载范围"
+        "与本次超时预算有效。"
+    ]
+
+
+def plateau_point(
+    cfg: Config, cap: StageStats, source: str = ""
+) -> Optional[ThroughputPoint]:
+    """由平台峰值级构造容量面事实点（D23）：a1_family=none、origin=plateau。
+
+    软退化服务没有 A1，过载形态无从归因，家族恒为 none；origin=plateau
+    使容量面与后续 --capacity-plan 能区分"膝点实测"与"平台估计"两种
+    读数口径（与 source 的 db 路径审计含义分开）。
+    """
+    io = _run_io_len(cfg)
+    if io is None or cap.ok_rps is None:
+        return None
+    return ThroughputPoint(
+        input_len=io[0],
+        output_len=io[1],
+        mu_rpm=cap.ok_rps * 60.0,
+        mu_tps=cap.total_tps,
+        input_tps=cap.input_tps,
+        output_tps=cap.output_tps,
+        req_conc=cap.concurrency,
+        n_samples=cap.n_total,
+        a1_family="none",
+        source=source,
+        origin="plateau",
     )
 
 
@@ -138,7 +223,7 @@ def knee_point(
 def merge_surface_point(
     cfg: Config, point: Optional[ThroughputPoint], reason: str = ""
 ) -> Tuple[Optional[str], List[str]]:
-    """把本次膝点并入容量面文件（replace-per-L）。返回 (路径或 None, 说明)。
+    """把本次读数并入容量面文件（replace-per-(L_in, L_out) 单元格）。返回 (路径或 None, 说明)。
 
     不同边界（base_url）的面对比用两个文件、不混装：既有文件记录的是
     别的边界时拒绝合并并原样保留，由报告与 stdout 说明。
@@ -146,7 +231,7 @@ def merge_surface_point(
     path = cfg.report.throughput_model_path
     notes: List[str] = []
     if point is None:
-        return None, notes + [reason or "本次运行未产生可入容量面的膝点事实。"]
+        return None, notes + [reason or "本次运行未产生可入容量面的读数事实。"]
     try:
         if surface_path_exists(path):
             existing = ThroughputSurface.load(path)
@@ -159,7 +244,7 @@ def merge_surface_point(
             existing.merge([point])
             existing.meta.setdefault("base_url", cfg.service.base_url)
             existing.save(path)
-            return path, notes + [f"本次膝点已并入既有容量面（按长度覆盖更新）：{path}"]
+            return path, notes + [f"本次读数已并入既有容量面（按 (L_in, L_out) 单元格覆盖更新）：{path}"]
         surface = ThroughputSurface.fit([point], {"base_url": cfg.service.base_url})
         surface.save(path)
         return path, notes + [f"容量面已创建：{path}"]
@@ -174,12 +259,19 @@ def merge_surface_point(
 def _header_lines(cfg: Config, meta: Dict[str, str], sl_notes: Sequence[str]) -> List[str]:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     started = meta.get("started_at", "unknown")
-    single = list(cfg.requests.prompt_token_targets)
-    len_txt = (
-        f"固定输入长度 {single[0]} tokens（单长度档）"
-        if len(single) == 1
-        else f"混合长度 {single}（容量面按膝点均值取坐标）"
+    ins = list(cfg.requests.prompt_token_targets)
+    outs = list(cfg.requests.output_token_choices)
+    in_txt = (
+        f"固定输入长度 {ins[0]} tokens（单输入档）"
+        if len(ins) == 1
+        else f"混合输入长度 {ins}（多档不入容量面）"
     )
+    out_txt = (
+        f"，固定输出长度 {outs[0]} tokens"
+        if len(outs) == 1
+        else f"，混合输出长度 {outs}（多档不入容量面）"
+    )
+    len_txt = in_txt + out_txt
     lines = [
         "# 推理服务容量（吞吐）评估报告",
         "",
@@ -188,6 +280,9 @@ def _header_lines(cfg: Config, meta: Dict[str, str], sl_notes: Sequence[str]) ->
         f"- 配置快照：模式 {cfg.load.mode}，负载阶梯 {cfg.load.concurrency_steps}，"
         f"每级 {cfg.load.stage_duration_s:g}s（预热 {cfg.load.warmup_s:g}s）；{len_txt}；"
         f"门限 {cfg.slo.target_mode}；Phase 0 基线 {'开' if cfg.load.baseline_enabled else '关'}",
+        f"- 本容量读数的超时预算：service.timeout_s = {cfg.service.timeout_s:g}s"
+        "（膝点 = 服务拒绝**或**客户放弃，D25；同一服务在不同超时预算下膝点与读数不同，"
+        "数字必须连同预算一起解读）",
         f"- 原始数据库：`{meta.get('db_path', 'unknown')}`",
         "",
         "> 范围声明：本报告只覆盖 `service.base_url` 指向的**推理服务本身**的容量。"
@@ -202,18 +297,81 @@ def _header_lines(cfg: Config, meta: Dict[str, str], sl_notes: Sequence[str]) ->
     return lines
 
 
+def _bottleneck_lines(cap: StageStats) -> List[str]:
+    """瓶颈判读：input/output 分解（膝点与平台两条结论路径共用）。"""
+    if cap.input_tps is None or cap.output_tps is None or cap.input_tps <= 0:
+        return []
+    if cap.input_tps >= cap.output_tps:
+        return [
+            f"瓶颈判读：输入侧 {cap.input_tps:,.0f} tok/s ≥ 输出侧 {cap.output_tps:,.0f} tok/s，"
+            "prefill 主导——扩容/调优优先看预填充批次与长上下文路径。"
+        ]
+    return [
+        f"瓶颈判读：输出侧 {cap.output_tps:,.0f} tok/s > 输入侧 {cap.input_tps:,.0f} tok/s，"
+        "decode 主导——扩容/调优优先看连续批处理宽度与 KV 容量。"
+    ]
+
+
 def _conclusion_lines(
     cfg: Config,
     stages: Sequence[StageStats],
     knee: Optional[StageStats],
     cap: Optional[StageStats],
     knee_notes: Sequence[str],
+    plateau_peak: Optional[StageStats] = None,
+    plateau_notes: Sequence[str] = (),
 ) -> Tuple[List[str], List[str]]:
-    """结论区。返回 (结论行, 附加说明行)——SLA/SLO 与窗口承诺判定。"""
+    """结论区。返回 (结论行, 附加说明行)——SLA/SLO 与窗口承诺判定。
+
+    knee=None 且平台判定成立（D23）时走平台口径：读数明确标注
+    "非膝点、软退化平台估计"；平台判定也不成立时维持"未确定容量膝点"
+    的诚实降级，并附平台判定的排除理由。
+    """
     lines: List[str] = []
     extra: List[str] = []
+    if plateau_peak is not None:
+        ok_rps = plateau_peak.ok_rps
+        sla_rpm = ok_rps * 60.0 if ok_rps is not None else None
+        lines.append(
+            "**范围内饱和读数（非膝点：软退化平台估计，D23）**：负载梯度内全程未出现 A1，"
+            "服务不拒绝、只变慢（排队型饱和）。"
+            + (
+                f"SLA 口径读数 = {sla_rpm:,.1f} RPM（峰值 ok_rps {ok_rps:.2f} rps × 60 "
+                f"@ 负载 {plateau_peak.concurrency}）。"
+                if sla_rpm is not None
+                else "有效完成速率不可用，无法给出 RPM 口径读数。"
+            )
+            + "该数字是梯度范围内的饱和平台估计：负载继续加码服务不会失败、只会更慢，"
+            "读数不构成「接得住」意义上的 SLA。"
+        )
+        if plateau_peak.total_tps is not None:
+            lines.append(
+                f"吞吐构成：全量 {plateau_peak.total_tps:,.0f} tokens/s"
+                + (
+                    f"（输入 {plateau_peak.input_tps:,.0f} + 输出 {plateau_peak.output_tps:,.0f}）。"
+                    if plateau_peak.input_tps is not None and plateau_peak.output_tps is not None
+                    else "。"
+                )
+            )
+        extra.extend(_bottleneck_lines(plateau_peak))
+        a = cfg.analysis
+        if a.window_requests > 0 and a.window_hours > 0 and sla_rpm is not None:
+            required = a.window_requests / (a.window_hours * 60.0)
+            line = required * a.window_safety_factor
+            verdict = "达标" if sla_rpm >= line else "**未达标**"
+            lines.append(
+                f"窗口承诺判定（平台口径）：{verdict}——验收线 {line:,.1f} RPM，"
+                f"平台读数 {sla_rpm:,.1f} RPM；判定随超时预算（timeout_s）与"
+                "已测负载范围变化，不是膝点口径的承诺。"
+            )
+        elif a.window_requests > 0 or a.window_hours > 0:
+            extra.append("窗口承诺只配了一半（window_requests / window_hours 需同时设置），本次不给达标判定。")
+        else:
+            extra.append("未设窗口承诺（analysis.window_requests / window_hours = 0）：本报告只陈述实测值。")
+        return lines, extra
+
     if knee is None or cap is None:
-        lines.append("**未确定容量膝点**：" + "；".join(knee_notes))
+        lines.append("**未确定容量膝点**：" + "；".join(list(knee_notes) + list(plateau_notes)))
         return lines, extra
 
     ok_rps = cap.ok_rps
@@ -242,17 +400,7 @@ def _conclusion_lines(
         )
 
     # 瓶颈判读：input/output 分解
-    if cap.input_tps is not None and cap.output_tps is not None and cap.input_tps > 0:
-        if cap.input_tps >= cap.output_tps:
-            extra.append(
-                f"瓶颈判读：输入侧 {cap.input_tps:,.0f} tok/s ≥ 输出侧 {cap.output_tps:,.0f} tok/s，"
-                "prefill 主导——扩容/调优优先看预填充批次与长上下文路径。"
-            )
-        else:
-            extra.append(
-                f"瓶颈判读：输出侧 {cap.output_tps:,.0f} tok/s > 输入侧 {cap.input_tps:,.0f} tok/s，"
-                "decode 主导——扩容/调优优先看连续批处理宽度与 KV 容量。"
-            )
+    extra.extend(_bottleneck_lines(cap))
 
     # 窗口承诺判定（人工只给承诺，验收线由实测反推）
     a = cfg.analysis
@@ -271,14 +419,19 @@ def _conclusion_lines(
         )
         # TPS 侧预算核对（同一承诺的 token 视角）
         avg_out = cap.completion_tokens_avg
-        input_len = _run_input_len(cfg, knee)
-        if slo_tps is not None and avg_out and input_len:
-            budget_tps = a.window_requests * (input_len + avg_out) / (a.window_hours * 3600.0)
+        io = _run_io_len(cfg)
+        if slo_tps is not None and avg_out and io:
+            budget_tps = a.window_requests * (io[0] + avg_out) / (a.window_hours * 3600.0)
             verdict_tps = "达标" if slo_tps >= budget_tps else "未达标"
             lines.append(
-                f"token 预算核对：{a.window_requests:,} 请求 ×（{input_len} + {avg_out:.0f}）"
+                f"token 预算核对：{a.window_requests:,} 请求 ×（{io[0]} + {avg_out:.0f}）"
                 f"tokens / {a.window_hours:g}h ⇒ 需求 μ ≥ {budget_tps:,.0f} tokens/s；"
                 f"实测 SLO = {slo_tps:,.0f} tokens/s（{verdict_tps}）。"
+            )
+        else:
+            extra.append(
+                "token 预算核对未执行：需要实测 SLO、实测平均输出长度与可定的 "
+                "(L_in, L_out) 坐标（D22，混合档位不猜测）。"
             )
     elif a.window_requests > 0 or a.window_hours > 0:
         extra.append("窗口承诺只配了一半（window_requests / window_hours 需同时设置），本次不给达标判定。")
@@ -316,7 +469,12 @@ def _capacity_table(stages: Sequence[StageStats]) -> List[str]:
     return lines
 
 
-def _knee_evidence_lines(stages: Sequence[StageStats], knee: Optional[StageStats]) -> List[str]:
+def _knee_evidence_lines(
+    stages: Sequence[StageStats],
+    knee: Optional[StageStats],
+    plateau_peak: Optional[StageStats] = None,
+    plateau_notes: Sequence[str] = (),
+) -> List[str]:
     ordered = sorted((s for s in stages if s.n_total > 0), key=lambda s: s.concurrency)
     lines: List[str] = []
     if knee is not None:
@@ -325,6 +483,8 @@ def _knee_evidence_lines(stages: Sequence[StageStats], knee: Optional[StageStats
             f"（A1={knee.a1}/{knee.n_total}，{pct(knee.a1 / knee.n_total, 2)}），"
             "服务自该水平起接不住——这就是容量拐点，而非人工设定值。"
         )
+    elif plateau_peak is not None:
+        lines.append("- **平台判定（D23，软退化）**：" + " ".join(plateau_notes))
     # 平台佐证：连续两级有效完成速率增幅 < 5%
     flat: List[str] = []
     drop: List[str] = []
@@ -374,8 +534,28 @@ def _attribution_lines(stages: Sequence[StageStats]) -> List[str]:
 
 
 def _advice_lines(cfg: Config, stages: Sequence[StageStats], knee: Optional[StageStats],
-                  cap: Optional[StageStats], knee_notes: Sequence[str]) -> List[str]:
+                  cap: Optional[StageStats], knee_notes: Sequence[str],
+                  plateau_peak: Optional[StageStats] = None) -> List[str]:
     lines: List[str] = []
+    if plateau_peak is not None:
+        lines.append("- **软退化（排队型）服务**：过载只投影为变慢而不拒绝（D17 超时族形态）。"
+                     "治理动作在入口侧：客户端超时与背压（在途上限、退避）、准入控制；"
+                     "单纯加并发只会把容量数字变成排队时长。")
+        lines.append("- **平台读数的外推纪律（D23/D25）**：读数只对已测负载范围与本次超时预算"
+                     "（timeout_s）有效；再加大负载不会产生失败信号，只会拉长时延——"
+                     "上线必须配合时延/水位监控，不能指望服务报错。")
+        a = cfg.analysis
+        if a.window_requests > 0 and a.window_hours > 0 and cap.ok_rps is not None:
+            sla_rpm = cap.ok_rps * 60.0
+            required = a.window_requests / (a.window_hours * 60.0) * a.window_safety_factor
+            if sla_rpm < required:
+                lines.append(
+                    f"- **容量缺口 {required - sla_rpm:,.1f} RPM（平台口径）**：扩容"
+                    "（副本/并行度）、缩短输入/输出长度、或与业务方重谈窗口承诺。"
+                )
+        lines.append("- **判据校准**：平台判定（末级边际 < 5%）是经验阈值；梯度太粗会伪造"
+                     "「未饱和」（建议最小梯度档 ≥ 末级并发的 25%），判读存疑时加密梯度复测。")
+        return lines
     if knee is None or cap is None:
         lines.append("- **提高梯度上限复测**：" + "；".join(knee_notes))
         return lines
@@ -407,6 +587,65 @@ def _advice_lines(cfg: Config, stages: Sequence[StageStats], knee: Optional[Stag
     return lines
 
 
+def _validate_stage_consistency(
+    cfg: Config, stage: StageStats, rows: List[Dict[str, Any]]
+) -> List[str]:
+    """两道数据质量闸门（D24，仅吞吐路径调用；只警告不阻断）。
+
+    - Little's Law（闭环）：rps × 平均E2E ≈ 施压并发。偏差超阈说明该级
+      计时窗被污染（疑似冷启动/预热泄漏/外部干扰）——负载更大不可能
+      "更快"，闭环下吞吐与时延的乘积必须守恒。
+    - 时延恒等式：E2E ≈ TTFT + TPOT×(输出-1)（逐请求残差均值）。偏差
+      超阈说明时延构成不自洽（字段口径错位或数据损坏）。
+
+    两闸门互相独立、可互为佐证；输入全部来自请求明细现场计算，不落库、
+    不改变任何容量数字（结果只进本报告诊断行，R4）。前置排除：think_time
+    改变闭环守恒式（E2E 需加思考时间）与存在 aborted（窗口计入放弃请求
+    但无 E2E）时，Little's Law 不适用，跳过而非误报。
+    """
+    if not rows:
+        return [f"负载 {stage.concurrency}：请求明细缺失，无法执行数据质量校验（D24）。"]
+    measured = [r for r in rows if r.get("status") != "aborted"]
+    if len(measured) < _MIN_DIAG_SAMPLES:
+        return []
+    diags: List[str] = []
+    if (
+        cfg.load.mode == "closed"
+        and cfg.load.think_time_s <= 0
+        and stage.n_aborted == 0
+        and stage.rps is not None
+        and stage.concurrency > 0
+    ):
+        e2es = [r["e2e_ms"] for r in measured if r.get("e2e_ms") is not None]
+        if len(e2es) >= _MIN_DIAG_SAMPLES:
+            lhs = stage.rps * (sum(e2es) / len(e2es)) / 1000.0
+            dev = abs(lhs - stage.concurrency) / stage.concurrency
+            if dev > _CONSISTENCY_TOL:
+                diags.append(
+                    f"负载 {stage.concurrency}：Little's Law 一致性异常——"
+                    f"rps×平均E2E = {lhs:.2f}，与施压并发 {stage.concurrency} 偏差 "
+                    f"{dev:.0%}（>{_CONSISTENCY_TOL:.0%}），疑似冷启动/计时污染（D24）。"
+                )
+    resid: List[float] = []
+    for r in measured:
+        e2e = r.get("e2e_ms")
+        ttft = r.get("ttft_ms")
+        tpot = r.get("tpot_ms")
+        out = r.get("completion_tokens")
+        if e2e is None or ttft is None or tpot is None or not out or out < 2 or e2e <= 0:
+            continue
+        resid.append(abs(e2e - ttft - tpot * (out - 1)) / e2e)
+    if len(resid) >= _MIN_DIAG_SAMPLES:
+        mean_resid = sum(resid) / len(resid)
+        if mean_resid > _CONSISTENCY_TOL:
+            diags.append(
+                f"负载 {stage.concurrency}：时延恒等式偏差均值 {mean_resid:.1%}"
+                f"（>{_CONSISTENCY_TOL:.0%}）——E2E 与 TTFT+TPOT×(输出-1) 不自洽，"
+                "时延构成异常（D24）。"
+            )
+    return diags
+
+
 def render_report_batch(
     cfg: Config,
     store: RecordStore,
@@ -427,26 +666,48 @@ def render_report_batch(
         ]
     cap = capacity_stage(stages, knee) if knee is not None else None
 
+    # 软退化平台判定（D23）：仅在膝点未触达时启用第二读数口径
+    plateau_peak, plateau_notes = (None, [])
+    if knee is None:
+        plateau_peak, plateau_notes = plateau_reading(stages)
+    if plateau_peak is not None:
+        cap = plateau_peak
+
     source = meta.get("db_path", "")
-    point = knee_point(cfg, knee, cap, source=source) if (knee is not None and cap is not None) else None
+    point = None
+    if knee is not None and cap is not None:
+        point = knee_point(cfg, knee, cap, source=source)
+    elif plateau_peak is not None:
+        point = plateau_point(cfg, plateau_peak, source=source)
     skip_reason = ""
-    if knee is not None and point is None:
+    if (knee is not None or plateau_peak is not None) and point is None:
         skip_reason = (
-            "本次膝点缺少入容量面的坐标（输入长度不可定或有效速率缺失），仅出报告。"
+            "本次读数缺少入容量面的坐标（(L_in, L_out) 组合不可定或有效速率缺失），仅出报告。"
         )
     surface_path, surface_notes = merge_surface_point(cfg, point, reason=skip_reason)
+
+    # 数据质量诊断（D24）：仅吞吐路径（R4）；从请求明细现场计算，
+    # 不写库、不改变任何容量数字，只进本报告诊断行
+    diagnostics: List[str] = []
+    for s in stages:
+        if s.n_total <= 0:
+            continue
+        diagnostics.extend(_validate_stage_consistency(cfg, s, store.stage_rows(s.stage_id)))
 
     lines: List[str] = []
     lines.extend(_header_lines(cfg, meta, list(knee_notes) + list(sl_finding.notes)))
     if surface_path:
-        lines.append(f"- 容量面：`{surface_path}`（本次膝点已并入，replace-per-L）")
+        lines.append(f"- 容量面：`{surface_path}`（本次读数已并入，replace-per-(L_in, L_out)）")
     else:
         lines.append(f"- 容量面：未写入——{surface_notes[-1] if surface_notes else '未知原因'}")
     lines.append("")
 
     lines.append("## 一、结论")
     lines.append("")
-    conclusions, extra = _conclusion_lines(cfg, stages, knee, cap, knee_notes)
+    conclusions, extra = _conclusion_lines(
+        cfg, stages, knee, cap, knee_notes,
+        plateau_peak=plateau_peak, plateau_notes=plateau_notes,
+    )
     for item in conclusions:
         lines.append(f"- {item}")
     lines.append("")
@@ -458,11 +719,16 @@ def render_report_batch(
     lines.append("## 二、容量表（逐级）")
     lines.append("")
     lines.extend(_capacity_table(stages))
-    lines.append("")
+    if diagnostics:
+        lines.append("### 数据质量诊断（D24，仅警告不阻断）")
+        lines.append("")
+        for d in diagnostics:
+            lines.append(f"- {d}")
+        lines.append("")
 
     lines.append("## 三、膝点证据")
     lines.append("")
-    lines.extend(_knee_evidence_lines(stages, knee))
+    lines.extend(_knee_evidence_lines(stages, knee, plateau_peak, plateau_notes))
     lines.append("")
 
     lines.append("## 四、A1 归因（过载形态）")
@@ -472,7 +738,7 @@ def render_report_batch(
 
     lines.append("## 五、建议")
     lines.append("")
-    lines.extend(_advice_lines(cfg, stages, knee, cap, knee_notes))
+    lines.extend(_advice_lines(cfg, stages, knee, cap, knee_notes, plateau_peak=plateau_peak))
     lines.append("")
 
     lines.append("## 六、方法与口径")
@@ -490,7 +756,17 @@ def render_report_batch(
                  "排队型饱和时膝点级即峰值（二者一致）；硬拒绝型服务在膝点级即坍塌"
                  "（该级大部分请求被拒），取低压峰值并在结论中显式说明。")
     lines.append("6. 容量面（throughput_model.npz）由本报告报告期汇写：只存事实点与 meta，"
-                 "查询按长度线性插值，超范围 clamp 并标 extrapolated（§7.10.5）。")
+                 "坐标为 (输入, 输出) 长度组合（D22）；查询按双线性插值，任一坐标超范围 "
+                 "clamp 并标 extrapolated，网格角点未实测时回退最近点并显式说明（§7.10.5）。")
+    lines.append("7. **膝点 = 服务拒绝 或 客户放弃**（D25）：A1 拒绝族是服务端有界队列显式拒绝；"
+                 "超时族是队列无限吸收、过载投影为迟到——膝点位置由客户端 timeout_s 框定"
+                 "（见报告头超时预算行），不同预算下的容量读数不可比。")
+    lines.append("8. 软退化（全程无 A1）服务以平台期第二读数收场（D23）：末级边际增幅 < 5% 且"
+                 "峰值不低于末级 5% 时给「范围内饱和读数」并入容量面（origin=plateau）；"
+                 "该读数非膝点，只对已测负载范围与超时预算有效。")
+    lines.append("9. 数据质量闸门（D24，仅吞吐路径）：闭环下 rps×平均E2E≈并发（Little's Law）"
+                 "与 E2E≈TTFT+TPOT×(输出-1)（时延恒等式）两道独立校验，偏差 >15% 记入第二节"
+                 "诊断行；只警告不阻断，不改变任何容量数字。")
     lines.append("")
     return "\n".join(lines), surface_path, surface_notes
 

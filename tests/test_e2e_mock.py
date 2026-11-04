@@ -238,6 +238,173 @@ class MockE2ETest(unittest.TestCase):
         ])
         self.assertEqual(code2, 0, out2)
         self.assertIn("clamp", out2)
+        # D22/D23：显式 --output-len 反查二维坐标，读数来源随印（膝点口径）
+        code3, out3 = self._run_cli([
+            "--capacity-plan", str(surface), "--target-rpm", "100",
+            "--input-len", "2048", "--output-len", "64",
+        ])
+        self.assertEqual(code3, 0, out3)
+        self.assertIn("输出 64 tokens", out3)
+        self.assertIn("读数来源", out3)
+        self.assertIn("膝点实测", out3)
+
+
+PLATEAU_CONFIG = """
+[service]
+base_url = "http://127.0.0.1:{port}"
+path = "/v1/chat/completions"
+model = "mock-model"
+timeout_s = 30.0
+connect_timeout_s = 5.0
+
+[slo]
+ttft_target_s = 2.0
+tpot_target_ms = 50.0
+target_mode = "absolute"
+min_completion_tokens = 2
+
+[load]
+mode = "closed"
+concurrency_steps = [16, 48, 80]
+stage_duration_s = 8.0
+max_stage_duration_s = 12.0
+warmup_s = 0.0
+max_requests_per_stage = 5000
+drain_timeout_s = 10.0
+baseline_enabled = false
+
+[requests]
+max_context_tokens = 4096
+prompt_token_targets = [256]
+prompt_weights = [1.0]
+output_token_choices = [{output_len}]
+output_weights = [1.0]
+length_buckets = [4096]
+stream = true
+unique_prefix = true
+seed = 20261103
+
+[analysis]
+sla_target = 0.999
+slo_target = 0.95
+min_samples_per_stage = 60
+
+[storage]
+db_path = "{dir}/plateau_{output_len}.db"
+
+[report]
+kinds = ["throughput"]
+output_path = "{dir}/plateau_{output_len}.md"
+throughput_model_path = "{dir}/plateau_surface.npz"
+
+[qos_model]
+enabled = false
+"""
+
+
+class PlateauE2ETest(unittest.TestCase):
+    """案例 B 型软退化 E2E（D22/D23/D25 验收，约 80 秒）。
+
+    mock 无限队列（soft-capacity 1）：服务永不拒绝、只按在途排队变慢，
+    ok_rps 顶部走平（e2e = base + (C-1)×(queue_step + out×tpot/2) 对 C
+    线性 → rps 收敛到 1/b，相邻高压级增幅 ~0% << 5% 判据）→ 全程无 A1、
+    knee=None、平台判定成立。验证：
+    1. 两次运行（输出 8 / 16）按 (L_in, L_out) 单元格汇入同一张容量面；
+    2. 平台读数入面（origin=plateau, a1_family=none）且报告标注
+       "范围内饱和读数 / 非膝点"，报告头同印超时预算（D25）；
+    3. --capacity-plan 带 --output-len 反查给出平台口径读数来源。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tmp_dir("e2e_plateau")
+        cls.port = _free_port()
+        cls.mock = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "mock_server.py"),
+             "--port", str(cls.port), "--ttft-ms", "20", "--tpot-ms", "1",
+             "--soft-capacity", "1", "--infinite-queue", "--queue-step-s", "0.02"],
+            cwd=str(PROJECT_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{cls.port}/v1/models", timeout=1
+                ) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.3)
+        else:
+            cls.mock.terminate()
+            raise unittest.SkipTest("mock_server 未在 15s 内就绪")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.mock.terminate()
+        try:
+            cls.mock.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.mock.kill()
+        safe_rmtree(cls.dir)
+
+    def _config_path(self, output_len: int) -> Path:
+        path = self.dir / f"plateau_{output_len}.toml"
+        path.write_text(
+            PLATEAU_CONFIG.format(port=self.port, dir=str(self.dir), output_len=output_len)
+            .replace("\\", "/"),
+            encoding="utf-8")
+        return path
+
+    def _cli(self, argv):
+        buf = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = _cli.main(argv)
+        if code != 0:
+            raise AssertionError(f"CLI 退出码 {code}\nstdout:\n{buf.getvalue()}\nstderr:\n{err.getvalue()}")
+        return buf.getvalue()
+
+    def _ensure_runs(self):
+        """两次运行（输出 8 / 16）汇入同一张容量面；已跑过则复用，保证各
+        测试自给自足（unittest 按方法名字母序执行）。"""
+        surface = self.dir / "plateau_surface.npz"
+        if not surface.exists():
+            for output_len in (8, 16):
+                self._cli(["--config", str(self._config_path(output_len))])
+        return surface
+
+    def test_plateau_two_cells_surface_and_report(self):
+        surface = self._ensure_runs()
+        s = ThroughputSurface.load(str(surface))
+        self.assertEqual(len(s.points), 2, "两个 (L_in, L_out) 组合应各自成格")
+        self.assertEqual(sorted(p.output_len for p in s.points), [8, 16])
+        for p in s.points:
+            self.assertEqual(p.input_len, 256)
+            self.assertEqual(p.origin, "plateau")
+            self.assertEqual(p.a1_family, "none")
+        # kinds=["throughput"]：不产在线报告，只产吞吐报告（R4 隔离）
+        for output_len in (8, 16):
+            self.assertFalse((self.dir / f"plateau_{output_len}.md").exists(),
+                             "kinds 仅 throughput 不应产出在线报告")
+            text = (self.dir / f"plateau_{output_len}_throughput.md").read_text(encoding="utf-8")
+            self.assertIn("范围内饱和读数", text)
+            self.assertIn("非膝点", text)
+            self.assertIn("软退化平台估计", text)
+            # D25：容量读数与超时预算同印
+            self.assertIn("超时预算", text)
+            self.assertIn("timeout_s = 30", text)
+
+    def test_capacity_plan_plateau_with_output_len(self):
+        surface = self._ensure_runs()
+        out = self._cli([
+            "--capacity-plan", str(surface), "--target-rpm", "100",
+            "--input-len", "256", "--output-len", "12",
+        ])
+        self.assertIn("输出 12 tokens", out)
+        self.assertIn("读数来源", out)
+        self.assertIn("软退化平台估计", out)
+        self.assertIn("可达", out)
 
 
 if __name__ == "__main__":
