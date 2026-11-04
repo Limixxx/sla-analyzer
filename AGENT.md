@@ -212,6 +212,5 @@ TTFT≈230ms / TPOT≈21ms / E2E≈1.5s；上面的快速自测约 55 秒跑完�
 
 - 不引入第三方依赖，不改用 requests/httpx/numpy/torch，不做在线推理或进入请求路径。
 - 不做服务端资源级水位（KV Cache / 批 slot / GPU）计算——那是服务端 Prometheus 与调度器的职责。
-- 不做动态 SLA 目标、不用本次高压分位数定标门限、不把 aborted 计入任何比率。
 - 不擅自对真实服务发起压测；需要集群地址、模型名、API Key 时向用户索取。
 - 不把 `baseline_relative` 口径的"达标"当跨引擎可比的结论——横向比较只能用质量退化率与原始分位数。
